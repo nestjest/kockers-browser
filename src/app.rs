@@ -21,9 +21,22 @@ pub fn run(main_args: &MainArgs, command_line: &CommandLine, sandbox_info: *mut 
         return exit_code;
     }
 
+    let root_cache_path = std::env::var_os("LOCALAPPDATA")
+        .map(|path| {
+            std::path::PathBuf::from(path)
+                .join("Kockers Browser")
+                .join("CEF")
+        })
+        .and_then(|path| path.into_os_string().into_string().ok());
+    let Some(root_cache_path) = root_cache_path else {
+        platform::show_fatal_error("Не удалось определить каталог данных LOCALAPPDATA.");
+        return 1;
+    };
+
     let controller = Arc::new(Mutex::new(browser::BrowserController::default()));
     let mut app = KockersApp::new(controller);
     let settings = Settings {
+        root_cache_path: CefString::from(root_cache_path.as_str()),
         no_sandbox: 0,
         multi_threaded_message_loop: 0,
         external_message_pump: 0,
@@ -38,9 +51,6 @@ pub fn run(main_args: &MainArgs, command_line: &CommandLine, sandbox_info: *mut 
         sandbox_info,
     ) != 1
     {
-        platform::show_fatal_error(
-            "Не удалось инициализировать Chromium Embedded Framework. Проверьте файлы CEF рядом с приложением.",
-        );
         return 1;
     }
 
@@ -71,6 +81,18 @@ wrap_browser_process_handler! {
     }
 
     impl BrowserProcessHandler {
+        fn on_already_running_app_relaunch(
+            &self,
+            _command_line: Option<&mut CommandLine>,
+            _current_directory: Option<&CefString>,
+        ) -> i32 {
+            let window = browser::lock_controller(&self.controller).window();
+            if !window.is_null() {
+                unsafe { platform::focus_address(window) };
+            }
+            1
+        }
+
         fn on_context_initialized(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
 

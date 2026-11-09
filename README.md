@@ -2,6 +2,14 @@
 
 Минимальный нативный браузер на Rust с настоящим Chromium Embedded Framework. Windows-версия использует Win32 для панели и windowed CEF для содержимого. Sandbox и web security не отключаются.
 
+## Установка для пользователей Windows
+
+1. Скачайте `KockersBrowser-0.1.0-alpha.1-windows-x64-setup.exe` из [alpha-релиза](https://github.com/nestjest/kockers-browser/releases/tag/v0.1.0-alpha.1).
+2. Запустите установщик и следуйте шагам мастера. Установка выполняется для текущего пользователя и не требует прав администратора.
+3. По умолчанию браузер устанавливается в `%LOCALAPPDATA%\Programs\Kockers Browser`; ярлык создаётся в меню «Пуск».
+
+Установщик и браузер пока не имеют цифровой подписи, поэтому Windows SmartScreen может показать предупреждение. Удаление выполняется через «Установленные приложения» в настройках Windows.
+
 ## Технологии
 
 - Rust stable, Cargo, edition 2024.
@@ -48,6 +56,15 @@ Release:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/run.ps1 -Release
 ```
+
+Сборка EXE-установщика:
+
+```powershell
+winget install --id JRSoftware.InnoSetup --exact
+powershell -ExecutionPolicy Bypass -File scripts/installer.ps1
+```
+
+Скрипт собирает release и создаёт установщик в `dist`. Inno Setup включает весь необходимый CEF runtime и локальную копию Microsoft `vcruntime140.dll`, но исключает PDB, LIB и временные build-файлы.
 
 Для отдельных команд Cargo:
 
