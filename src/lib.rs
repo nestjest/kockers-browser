@@ -7,6 +7,8 @@ mod navigation;
 #[cfg(target_os = "windows")]
 pub mod platform;
 #[cfg(target_os = "windows")]
+mod storage;
+#[cfg(target_os = "windows")]
 mod ui;
 
 /// # Safety
