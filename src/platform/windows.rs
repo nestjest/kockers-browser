@@ -49,6 +49,7 @@ const CLOSE_HOVER: COLORREF = rgb(0xC5, 0x42, 0x3B);
 const ID_ADDRESS: usize = 103;
 const ID_DOWNLOAD_OVERLAY: usize = 110;
 const ICON_ID: usize = 1;
+const LOGO_MARK_ID: usize = 2;
 const ANIMATION_TIMER: usize = 1;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWCP_ROUND: u32 = 2;
@@ -234,7 +235,7 @@ impl NativeUi {
             subclass_control(self.address);
             self.logo_icon = LoadImageW(
                 instance,
-                ICON_ID as *const u16,
+                LOGO_MARK_ID as *const u16,
                 IMAGE_ICON,
                 28,
                 28,

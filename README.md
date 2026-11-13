@@ -129,7 +129,9 @@ assets/
   logo.svg
   logo.png
   logo-small.png
-  app.ico
+  app.ico                 # иконка приложения на светлой плашке: exe, ярлыки, установщик
+  app-icon.svg            # исходник app.ico
+  logo-mark.ico           # «K» без плашки для панели вкладок
 scripts/
   cargo.ps1
   build.ps1
