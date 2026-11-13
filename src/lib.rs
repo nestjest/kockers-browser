@@ -10,6 +10,8 @@ pub mod platform;
 mod storage;
 #[cfg(target_os = "windows")]
 mod ui;
+#[cfg(target_os = "windows")]
+mod update;
 
 /// # Safety
 /// Вызывается только загрузчиком CEF с действительными WinMain- и sandbox-аргументами.

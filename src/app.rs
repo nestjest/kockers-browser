@@ -1,4 +1,4 @@
-use crate::{browser, platform};
+use crate::{browser, platform, update};
 use cef::*;
 use std::{
     cell::RefCell,
@@ -54,6 +54,10 @@ pub fn run(main_args: &MainArgs, command_line: &CommandLine, sandbox_info: *mut 
         return 1;
     }
 
+    let disable_update = CefString::from("disable-update-check");
+    if command_line.has_switch(Some(&disable_update)) == 0 {
+        update::start();
+    }
     run_message_loop();
     shutdown();
     0

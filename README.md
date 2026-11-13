@@ -4,9 +4,11 @@
 
 ## Установка для пользователей Windows
 
-1. Скачайте `KockersBrowser-0.1.0-alpha.1-windows-x64-setup.exe` из [alpha-релиза](https://github.com/nestjest/kockers-browser/releases/tag/v0.1.0-alpha.1).
+1. Скачайте `KockersBrowser-0.2.0-windows-x64-setup.exe` из [релиза 0.2.0](https://github.com/nestjest/kockers-browser/releases/tag/v0.2.0).
 2. Запустите установщик и следуйте шагам мастера. Установка выполняется для текущего пользователя и не требует прав администратора.
 3. По умолчанию браузер устанавливается в `%LOCALAPPDATA%\Programs\Kockers Browser`; ярлык создаётся в меню «Пуск».
+
+После установки браузер автоматически проверяет GitHub Releases при запуске. Новый установщик скачивается по HTTPS, сверяется с SHA-256 из `SHA256SUMS.txt`, устанавливается без дополнительных действий и перезапускает браузер. Для диагностики проверку можно отключить аргументом `--disable-update-check`.
 
 Установщик и браузер пока не имеют цифровой подписи, поэтому Windows SmartScreen может показать предупреждение. Удаление выполняется через «Установленные приложения» в настройках Windows.
 
@@ -119,6 +121,7 @@ src/
   browser.rs              # вкладки, CEF callbacks, разрешения и загрузки
   navigation.rs           # чистая модель URL/поиска
   storage.rs              # настройки, история и сессия
+  update.rs               # GitHub Releases, WinHTTP и проверка SHA-256
   platform/windows.rs     # собственное Win32-окно, панель и анимации
   ui/pages.rs             # стартовая страница и страница ошибок
   bin/bundle.rs           # упаковка через cef::build_util

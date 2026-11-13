@@ -1,4 +1,4 @@
-#define AppVersion "0.1.0-alpha.1"
+#define AppVersion "0.2.0"
 #define AppName "Kockers Browser"
 #define AppPublisher "KOCKERS SOCIETY"
 #define AppURL "https://github.com/nestjest/kockers-browser"
@@ -29,10 +29,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=yes
 RestartApplications=no
-VersionInfoVersion=0.1.0.0
+VersionInfoVersion=0.2.0.0
 VersionInfoDescription={#AppName} Setup
 VersionInfoProductName={#AppName}
-VersionInfoProductVersion=0.1.0.0
+VersionInfoProductVersion=0.2.0.0
 VersionInfoProductTextVersion={#AppVersion}
 
 [Files]
@@ -48,6 +48,13 @@ Name: "{autodesktop}\Kockers Browser"; Filename: "{app}\{#AppExeName}"; IconFile
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Запустить Kockers Browser"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Parameters: "/updated"; Flags: nowait runasoriginaluser; Check: IsUpdate
+
+[Code]
+function IsUpdate(): Boolean;
+begin
+  Result := Pos('/UPDATE', Uppercase(GetCmdTail)) > 0;
+end;
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\debug.log"
