@@ -12,7 +12,7 @@ use std::{
         OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -25,9 +25,10 @@ use windows_sys::Win32::{
         GdiPlus::{
             FillModeAlternate, GdipCreateFromHDC, GdipCreatePen1, GdipCreateSolidFill,
             GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePen, GdipDrawArc, GdipDrawLines,
-            GdipDrawRectangle, GdipFillPolygon, GdipSetPenEndCap, GdipSetPenLineJoin,
-            GdipSetPenStartCap, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpBrush,
-            GpSolidFill, LineCapRound, LineJoinRound, PointF, SmoothingModeAntiAlias8x8, UnitPixel,
+            GdipDrawRectangle, GdipFillEllipse, GdipFillPolygon, GdipSetPenEndCap,
+            GdipSetPenLineJoin, GdipSetPenStartCap, GdipSetSmoothingMode, GdiplusStartup,
+            GdiplusStartupInput, GpBrush, GpSolidFill, LineCapRound, LineJoinRound, PointF,
+            SmoothingModeAntiAlias8x8, UnitPixel,
         },
     },
     System::{
@@ -65,7 +66,7 @@ const ACCENT: COLORREF = rgb(0x72, 0x7C, 0x45);
 const WARNING: COLORREF = rgb(0xB2, 0x6A, 0x28);
 const CLOSE_HOVER: COLORREF = rgb(0xC5, 0x42, 0x3B);
 const ID_ADDRESS: usize = 103;
-const ID_DOWNLOAD_OVERLAY: usize = 110;
+const ID_OVERLAY: usize = 110;
 const ICON_ID: usize = 1;
 const TAB_ICON_ID: usize = 2;
 const ANIMATION_TIMER: usize = 1;
@@ -74,7 +75,9 @@ const WM_FINALIZE_TAB: u32 = WM_APP + 2;
 const WM_DESTROY_TAB: u32 = WM_APP + 3;
 const WM_CLOSE_PANELS: u32 = WM_APP + 4;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+const DWMWA_BORDER_COLOR: u32 = 34;
 const DWMWCP_ROUND: u32 = 2;
+const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFF;
 const MENU_PRIVATE: usize = 2001;
 const MENU_HISTORY: usize = 2002;
 const MENU_DOWNLOAD_PROMPT: usize = 2003;
@@ -138,6 +141,42 @@ impl Spring {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PanelOffset {
+    value: f32,
+    from: f32,
+    target: f32,
+    started: Instant,
+}
+
+impl PanelOffset {
+    const DURATION: Duration = Duration::from_millis(160);
+
+    fn new(value: f32) -> Self {
+        Self {
+            value,
+            from: value,
+            target: value,
+            started: Instant::now(),
+        }
+    }
+
+    fn set_target(&mut self, target: f32) {
+        self.from = self.value;
+        self.target = target;
+        self.started = Instant::now();
+    }
+
+    fn step(&mut self, now: Instant) -> bool {
+        let progress = (now.duration_since(self.started).as_secs_f32()
+            / Self::DURATION.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        self.value = self.from + (self.target - self.from) * eased;
+        progress < 1.0
+    }
+}
+
 struct TabVisual {
     tab: TabSnapshot,
     x: Spring,
@@ -145,11 +184,17 @@ struct TabVisual {
     width: f32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelKind {
+    Downloads,
+    Menu,
+}
+
 struct NativeUi {
     controller: SharedController,
     window: HWND,
     address: HWND,
-    downloads_window: HWND,
+    overlay_window: HWND,
     mouse_hook: HHOOK,
     background_brush: HBRUSH,
     surface_brush: HBRUSH,
@@ -167,14 +212,16 @@ struct NativeUi {
     bookmarks: Vec<storage::Bookmark>,
     bookmarked: bool,
     show_bookmarks: bool,
-    show_downloads: bool,
-    downloads_visible: bool,
+    panel: Option<PanelKind>,
+    panel_open: bool,
+    panel_visible: bool,
+    menu_hover: usize,
     hover: Hit,
     pressed: Hit,
     drag_tab: Option<u64>,
     drag_origin: POINT,
     dragging: bool,
-    panel_offset: Spring,
+    panel_offset: PanelOffset,
     hover_amount: Spring,
     animation_running: bool,
     last_animation: Instant,
@@ -196,7 +243,7 @@ impl NativeUi {
             controller,
             window: ptr::null_mut(),
             address: ptr::null_mut(),
-            downloads_window: ptr::null_mut(),
+            overlay_window: ptr::null_mut(),
             mouse_hook: ptr::null_mut(),
             background_brush: ptr::null_mut(),
             surface_brush: ptr::null_mut(),
@@ -214,14 +261,16 @@ impl NativeUi {
             bookmarks,
             bookmarked,
             show_bookmarks,
-            show_downloads: false,
-            downloads_visible: false,
+            panel: None,
+            panel_open: false,
+            panel_visible: false,
+            menu_hover: 0,
             hover: Hit::None,
             pressed: Hit::None,
             drag_tab: None,
             drag_origin: POINT::default(),
             dragging: false,
-            panel_offset: Spring::new(0.0),
+            panel_offset: PanelOffset::new(0.0),
             hover_amount: Spring::new(0.0),
             animation_running: false,
             last_animation: Instant::now(),
@@ -253,7 +302,7 @@ impl NativeUi {
                 self.window,
                 ID_ADDRESS,
             )?;
-            self.downloads_window = CreateWindowExW(
+            self.overlay_window = CreateWindowExW(
                 0,
                 wide("KockersBrowserOverlay").as_ptr(),
                 ptr::null(),
@@ -263,11 +312,11 @@ impl NativeUi {
                 0,
                 0,
                 self.window,
-                ID_DOWNLOAD_OVERLAY as HMENU,
+                ID_OVERLAY as HMENU,
                 instance,
                 ptr::null(),
             );
-            if self.downloads_window.is_null() {
+            if self.overlay_window.is_null() {
                 return Err(format_windows_error("Не удалось создать панель загрузок"));
             }
             SendMessageW(self.address, WM_SETFONT, self.font as usize, 1);
@@ -316,11 +365,14 @@ impl NativeUi {
         let available = (width as f32 - 232.0).max(80.0);
         let pinned = self.tabs.iter().filter(|visual| visual.tab.pinned).count();
         let normal = self.tabs.len().saturating_sub(pinned);
-        let pinned_width = 46.0;
+        let gap = if self.tabs.is_empty() { 0.0 } else { 5.0 };
+        let pinned_width = if pinned == 0 { 0.0 } else { 46.0 };
         let normal_width = if normal == 0 {
             0.0
         } else {
-            ((available - pinned as f32 * pinned_width) / normal as f32).clamp(68.0, 188.0)
+            ((available - pinned as f32 * (pinned_width + gap) - normal as f32 * gap)
+                / normal as f32)
+                .clamp(1.0, 188.0)
         };
         let mut target = origin;
         for visual in &mut self.tabs {
@@ -330,11 +382,11 @@ impl NativeUi {
                 normal_width
             };
             if visual.x.value == 0.0 && visual.x.target == 0.0 {
-                visual.x.value = target + 28.0;
+                visual.x.value = target;
                 visual.x.velocity = 0.0;
             }
             visual.x.target = target;
-            target += visual.width + 5.0;
+            target += visual.width + gap;
         }
     }
 
@@ -354,7 +406,7 @@ impl NativeUi {
                 24,
                 1,
             );
-            self.layout_downloads();
+            self.layout_panel();
             lock_controller(&self.controller).resize_content();
             if !self.rounded_by_dwm {
                 if IsZoomed(self.window) != 0 {
@@ -397,32 +449,59 @@ impl NativeUi {
         rects
     }
 
-    fn layout_downloads(&mut self) {
-        if self.downloads_window.is_null() {
-            return;
-        }
+    fn panel_rect(&self) -> RECT {
         let (width, height) = unsafe { client_size(self.window) };
         let content_top = self.content_top();
-        let panel_width = 400.min(width - 24);
-        let desired_height = if self.downloads.is_empty() {
-            102
-        } else {
-            54 + self.downloads.len() as i32 * 74
+        let (panel_width, desired_height) = match self.panel.unwrap_or(PanelKind::Downloads) {
+            PanelKind::Downloads => (
+                400.min(width - 24),
+                if self.downloads.is_empty() {
+                    102
+                } else {
+                    54 + self.downloads.len() as i32 * 74
+                },
+            ),
+            PanelKind::Menu => (360.min(width - 24), main_menu_height()),
         };
-        let panel_height = desired_height.min((height - content_top - 24).max(90));
+        let panel_height = desired_height.min((height - content_top - 12).max(90));
+        let left = width - panel_width - 12;
+        let top = content_top + self.panel_offset.value.round() as i32;
+        RECT {
+            left,
+            top,
+            right: left + panel_width,
+            bottom: top + panel_height,
+        }
+    }
+
+    fn layout_panel(&mut self) {
+        if self.overlay_window.is_null() {
+            return;
+        }
+        let rect = self.panel_rect();
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
         unsafe {
-            MoveWindow(
-                self.downloads_window,
-                width - panel_width - 12,
-                content_top + self.panel_offset.value.round() as i32,
-                panel_width,
-                panel_height,
-                1,
-            );
-            let region = CreateRoundRectRgn(0, 0, panel_width + 1, panel_height + 1, 28, 28);
+            MoveWindow(self.overlay_window, rect.left, rect.top, width, height, 1);
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 28, 28);
             if !region.is_null() {
-                SetWindowRgn(self.downloads_window, region, 1);
+                SetWindowRgn(self.overlay_window, region, 1);
             }
+        }
+    }
+
+    fn move_panel(&self) {
+        let rect = self.panel_rect();
+        unsafe {
+            SetWindowPos(
+                self.overlay_window,
+                ptr::null_mut(),
+                rect.left,
+                rect.top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -492,45 +571,55 @@ impl NativeUi {
 
     fn update_downloads(&mut self) {
         self.downloads = lock_controller(&self.controller).downloads_snapshot();
-        self.layout_downloads();
-        unsafe {
-            InvalidateRect(self.downloads_window, ptr::null(), 1);
-            InvalidateRect(self.window, ptr::null(), 0);
+        if self.panel == Some(PanelKind::Downloads) {
+            self.layout_panel();
+            unsafe { InvalidateRect(self.overlay_window, ptr::null(), 1) };
         }
     }
 
     fn toggle_downloads(&mut self) {
-        if self.show_downloads {
+        self.toggle_panel(PanelKind::Downloads);
+    }
+
+    fn toggle_menu(&mut self) {
+        self.toggle_panel(PanelKind::Menu);
+    }
+
+    fn toggle_panel(&mut self, panel: PanelKind) {
+        if self.panel_open && self.panel == Some(panel) {
             self.close_panels();
             return;
         }
-        self.show_downloads = true;
-        self.downloads_visible = true;
-        self.downloads = lock_controller(&self.controller).downloads_snapshot();
-        self.panel_offset.value = 16.0;
-        self.panel_offset.velocity = 0.0;
-        self.panel_offset.target = 0.0;
-        self.layout_downloads();
+        if panel == PanelKind::Downloads {
+            self.downloads = lock_controller(&self.controller).downloads_snapshot();
+        } else {
+            self.menu_hover = 0;
+        }
+        self.panel = Some(panel);
+        self.panel_open = true;
+        self.panel_visible = true;
+        self.panel_offset = PanelOffset::new(12.0);
+        self.panel_offset.set_target(0.0);
+        self.layout_panel();
         unsafe {
-            ShowWindow(self.downloads_window, SW_SHOW);
             SetWindowPos(
-                self.downloads_window,
+                self.overlay_window,
                 HWND_TOP,
                 0,
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
             );
-            InvalidateRect(self.window, ptr::null(), 0);
+            InvalidateRect(self.overlay_window, ptr::null(), 0);
         }
         self.update_animation_timer();
     }
 
     fn close_panels(&mut self) {
-        if self.downloads_visible {
-            self.show_downloads = false;
-            self.panel_offset.target = 16.0;
+        if self.panel_visible && self.panel_open {
+            self.panel_open = false;
+            self.panel_offset.set_target(12.0);
             self.update_animation_timer();
         }
     }
@@ -544,7 +633,7 @@ impl NativeUi {
             .iter()
             .any(|visual| spring_active(&visual.x) || spring_active(&visual.close_hover))
             || spring_active(&self.hover_amount)
-            || (self.downloads_visible && spring_active(&self.panel_offset));
+            || (self.panel_visible && self.panel_offset.value != self.panel_offset.target);
         unsafe {
             if needed && !self.animation_running {
                 self.last_animation = Instant::now();
@@ -569,32 +658,28 @@ impl NativeUi {
             .as_secs_f32()
             .clamp(0.0001, 0.05);
         self.last_animation = now;
+        let mut repaint_toolbar = false;
         for visual in &mut self.tabs {
-            visual.x.step(dt);
+            repaint_toolbar |= visual.x.step(dt);
             visual.close_hover.target = if self.hover == Hit::TabClose(visual.tab.id) {
                 1.0
             } else {
                 0.0
             };
-            visual.close_hover.step(dt);
+            repaint_toolbar |= visual.close_hover.step(dt);
         }
-        self.hover_amount.step(dt);
-        if self.downloads_visible {
-            self.panel_offset.step(dt);
-            self.layout_downloads();
-            if !self.show_downloads
-                && self.panel_offset.value == self.panel_offset.target
-                && self.panel_offset.velocity == 0.0
-            {
-                self.downloads_visible = false;
-                unsafe { ShowWindow(self.downloads_window, SW_HIDE) };
+        repaint_toolbar |= self.hover_amount.step(dt);
+        if self.panel_visible {
+            let panel_animating = self.panel_offset.step(now);
+            self.move_panel();
+            if !self.panel_open && !panel_animating {
+                self.panel_visible = false;
+                self.panel = None;
+                unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
             }
         }
-        unsafe {
-            InvalidateRect(self.window, ptr::null(), 0);
-            if self.downloads_visible {
-                InvalidateRect(self.downloads_window, ptr::null(), 0);
-            }
+        if repaint_toolbar {
+            unsafe { InvalidateRect(self.window, ptr::null(), 0) };
         }
         self.update_animation_timer();
     }
@@ -676,7 +761,7 @@ impl NativeUi {
                 BrowserController::new_tab(&self.controller, pages::start_page_url(), false)
             }
             Hit::Downloads => self.toggle_downloads(),
-            Hit::Menu => unsafe { show_main_menu(self.window) },
+            Hit::Menu => self.toggle_menu(),
             Hit::Minimize => unsafe {
                 ShowWindow(self.window, SW_MINIMIZE);
             },
@@ -800,6 +885,12 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
             &preference as *const u32 as *const c_void,
             mem::size_of::<u32>() as u32,
         ) >= 0;
+        DwmSetWindowAttribute(
+            window,
+            DWMWA_BORDER_COLOR,
+            &DWMWA_COLOR_NONE as *const u32 as *const c_void,
+            mem::size_of::<u32>() as u32,
+        );
         if !small_icon.is_null() {
             SendMessageW(window, WM_SETICON, ICON_SMALL as usize, small_icon as isize);
         }
@@ -1113,6 +1204,8 @@ unsafe extern "system" fn window_proc(
                 }
             }
             WM_NCHITTEST => return non_client_hit_test(window, lparam),
+            WM_NCPAINT => return 0,
+            WM_NCACTIVATE => return 1,
             WM_ERASEBKGND => return 1,
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
@@ -1192,6 +1285,8 @@ unsafe extern "system" fn window_proc(
             WM_MOUSELEAVE => {
                 if let Some(ui) = ui_mut(window) {
                     ui.hover = Hit::None;
+                    ui.hover_amount.target = 0.0;
+                    ui.update_animation_timer();
                     InvalidateRect(window, ptr::null(), 0);
                 }
                 return 0;
@@ -1201,7 +1296,12 @@ unsafe extern "system" fn window_proc(
                 let y = high_word(lparam) as i32;
                 if let Some(ui) = ui_mut(window) {
                     let hit = ui.hit_test(x, y);
-                    if hit != Hit::Downloads {
+                    let toggle_hit = match ui.panel {
+                        Some(PanelKind::Downloads) => Hit::Downloads,
+                        Some(PanelKind::Menu) => Hit::Menu,
+                        None => Hit::None,
+                    };
+                    if hit != toggle_hit {
                         ui.close_panels();
                     }
                     ui.pressed = hit;
@@ -1362,12 +1462,18 @@ unsafe extern "system" fn mouse_proc(code: i32, message: WPARAM, data: LPARAM) -
             let mouse = &*(data as *const MOUSEHOOKSTRUCT);
             let window = GetAncestor(mouse.hwnd, GA_ROOT);
             if let Some(ui) = ui_mut(window)
-                && ui.show_downloads
-                && mouse.hwnd != ui.downloads_window
+                && ui.panel_open
+                && mouse.hwnd != ui.overlay_window
             {
                 let mut point = mouse.pt;
                 ScreenToClient(window, &mut point);
-                if ui.hit_test(point.x, point.y) != Hit::Downloads {
+                let hit = ui.hit_test(point.x, point.y);
+                let toggle_hit = match ui.panel {
+                    Some(PanelKind::Downloads) => Hit::Downloads,
+                    Some(PanelKind::Menu) => Hit::Menu,
+                    None => Hit::None,
+                };
+                if hit != toggle_hit {
                     PostMessageW(window, WM_CLOSE_PANELS, 0, 0);
                 }
             }
@@ -1390,34 +1496,79 @@ unsafe extern "system" fn overlay_proc(
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut paint);
                 if let Some(ui) = ui_mut(parent) {
-                    draw_download_panel(ui, dc);
+                    match ui.panel {
+                        Some(PanelKind::Downloads) => draw_download_panel(ui, dc),
+                        Some(PanelKind::Menu) => draw_main_menu(ui, dc),
+                        None => {}
+                    }
                 }
                 EndPaint(window, &paint);
+                0
+            }
+            WM_MOUSEMOVE => {
+                let y = high_word(lparam) as i32;
+                if let Some(ui) = ui_mut(parent)
+                    && ui.panel == Some(PanelKind::Menu)
+                {
+                    let hover = main_menu_command_at(y).unwrap_or(0);
+                    if ui.menu_hover != hover {
+                        ui.menu_hover = hover;
+                        InvalidateRect(window, ptr::null(), 0);
+                    }
+                    track_mouse_leave(window);
+                }
+                0
+            }
+            WM_MOUSELEAVE => {
+                if let Some(ui) = ui_mut(parent)
+                    && ui.panel == Some(PanelKind::Menu)
+                    && ui.menu_hover != 0
+                {
+                    ui.menu_hover = 0;
+                    InvalidateRect(window, ptr::null(), 0);
+                }
                 0
             }
             WM_LBUTTONUP => {
                 let x = low_word(lparam) as i32;
                 let y = high_word(lparam) as i32;
                 if let Some(ui) = ui_mut(parent) {
-                    let (width, _) = client_size(window);
-                    if y < 50 && x > width - 48 {
-                        ui.toggle_downloads();
-                    } else if y >= 54 {
-                        let index = ((y - 54) / 74) as usize;
-                        if let Some(download) = ui.downloads.get(index).cloned() {
-                            if x >= width - 58 {
-                                BrowserController::cancel_download(&ui.controller, download.id);
-                            } else if x >= width - 124 {
-                                if download.status == DownloadStatus::Complete {
-                                    BrowserController::open_download(&ui.controller, download.id);
-                                } else {
-                                    BrowserController::toggle_download_pause(
-                                        &ui.controller,
-                                        download.id,
-                                    );
+                    match ui.panel {
+                        Some(PanelKind::Menu) => {
+                            if let Some(command) = main_menu_command_at(y) {
+                                ui.close_panels();
+                                execute_main_menu_command(parent, command);
+                            }
+                        }
+                        Some(PanelKind::Downloads) => {
+                            let (width, _) = client_size(window);
+                            if y < 50 && x > width - 48 {
+                                ui.close_panels();
+                            } else if y >= 54 {
+                                let index = ((y - 54) / 74) as usize;
+                                if let Some(download) = ui.downloads.get(index).cloned() {
+                                    if x >= width - 58 {
+                                        BrowserController::cancel_download(
+                                            &ui.controller,
+                                            download.id,
+                                        );
+                                    } else if x >= width - 124 {
+                                        if download.status == DownloadStatus::Complete {
+                                            BrowserController::open_download(
+                                                &ui.controller,
+                                                download.id,
+                                            );
+                                        } else {
+                                            BrowserController::toggle_download_pause(
+                                                &ui.controller,
+                                                download.id,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
+                        None => {}
                     }
                 }
                 0
@@ -1505,6 +1656,7 @@ unsafe fn draw_address_overlay(address: HWND) {
         if text.is_empty() {
             SetTextColor(dc, SECONDARY);
             let mut placeholder = wide("Адрес или поиск");
+            rect.left += 6;
             rect.right -= 8;
             DrawTextW(
                 dc,
@@ -1624,7 +1776,7 @@ fn new_tab_rect(ui: &NativeUi) -> RECT {
     let after_tabs = ui
         .tabs
         .last()
-        .map(|visual| visual.x.value + visual.width + 6.0)
+        .map(|visual| visual.x.target + visual.width + 6.0)
         .unwrap_or(52.0);
     let left = (after_tabs.round() as i32).min((width - 182).max(52));
     RECT {
@@ -1947,6 +2099,7 @@ enum Icon {
     Pause,
     Play,
     Close,
+    Check,
     Bookmark,
     BookmarkFilled,
 }
@@ -2002,9 +2155,14 @@ static GDI_PLUS: OnceLock<usize> = OnceLock::new();
 unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
     const SIZE: f32 = 18.0;
     const STROKE: f32 = 1.8;
-    let scale = SIZE / 24.0;
-    let left = (target.left + target.right) as f32 / 2.0 - SIZE / 2.0;
-    let top = (target.top + target.bottom) as f32 / 2.0 - SIZE / 2.0;
+    let size = if matches!(icon, Icon::Home) {
+        20.0
+    } else {
+        SIZE
+    };
+    let scale = size / 24.0;
+    let left = (target.left + target.right) as f32 / 2.0 - size / 2.0;
+    let top = (target.top + target.bottom) as f32 / 2.0 - size / 2.0;
     let token = *GDI_PLUS.get_or_init(|| {
         let input = GdiplusStartupInput {
             GdiplusVersion: 1,
@@ -2044,7 +2202,10 @@ unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
                 &[(5.0, 12.0), (19.0, 12.0)],
                 &[(12.0, 5.0), (19.0, 12.0), (12.0, 19.0)],
             ],
-            Icon::Reload => &[&[(21.0, 3.0), (21.0, 8.0), (16.0, 8.0)]],
+            Icon::Reload => &[
+                &[(21.0, 3.0), (21.0, 8.0), (16.0, 8.0)],
+                &[(12.0, 3.0), (16.0, 4.1), (19.0, 6.0), (21.0, 8.0)],
+            ],
             Icon::Home => &[
                 &[(3.0, 11.0), (12.0, 3.0), (21.0, 11.0)],
                 &[(5.0, 10.0), (5.0, 20.0), (19.0, 20.0), (19.0, 10.0)],
@@ -2056,11 +2217,7 @@ unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
                 &[(7.0, 10.0), (12.0, 15.0), (17.0, 10.0)],
                 &[(5.0, 17.0), (5.0, 20.0), (19.0, 20.0), (19.0, 17.0)],
             ],
-            Icon::Menu => &[
-                &[(12.0, 5.0), (12.0, 5.01)],
-                &[(12.0, 12.0), (12.0, 12.01)],
-                &[(12.0, 19.0), (12.0, 19.01)],
-            ],
+            Icon::Menu => &[],
             Icon::Minimize => &[&[(5.0, 12.0), (19.0, 12.0)]],
             Icon::Restore => &[
                 &[
@@ -2081,6 +2238,7 @@ unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
             Icon::Pause => &[&[(9.0, 5.0), (9.0, 19.0)], &[(15.0, 5.0), (15.0, 19.0)]],
             Icon::Play => &[&[(8.0, 5.0), (19.0, 12.0), (8.0, 19.0), (8.0, 5.0)]],
             Icon::Close => &[&[(6.0, 6.0), (18.0, 18.0)], &[(18.0, 6.0), (6.0, 18.0)]],
+            Icon::Check => &[&[(5.0, 12.0), (10.0, 17.0), (19.0, 7.0)]],
             Icon::Bookmark | Icon::BookmarkFilled => &[&[
                 (12.0, 3.0),
                 (14.6, 8.3),
@@ -2107,16 +2265,33 @@ unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
             GdipDrawLines(graphics, pen, points.as_ptr(), points.len() as i32);
         }
         match icon {
+            Icon::Menu => {
+                let mut solid_brush: *mut GpSolidFill = ptr::null_mut();
+                if GdipCreateSolidFill(argb, &mut solid_brush) == 0 {
+                    let brush = solid_brush as *mut GpBrush;
+                    for y in [5.0, 12.0, 19.0] {
+                        GdipFillEllipse(
+                            graphics,
+                            brush,
+                            left + (12.0 - 1.5) * scale,
+                            top + (y - 1.5) * scale,
+                            3.0 * scale,
+                            3.0 * scale,
+                        );
+                    }
+                    GdipDeleteBrush(brush);
+                }
+            }
             Icon::Reload => {
                 GdipDrawArc(
                     graphics,
                     pen,
-                    left + 5.0 * scale,
-                    top + 5.0 * scale,
-                    14.0 * scale,
-                    14.0 * scale,
-                    -35.0,
-                    300.0,
+                    left + 3.0 * scale,
+                    top + 3.0 * scale,
+                    18.0 * scale,
+                    18.0 * scale,
+                    0.0,
+                    270.0,
                 );
             }
             Icon::Maximize => {
@@ -2160,7 +2335,7 @@ unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
 unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
     unsafe {
         let mut client = RECT::default();
-        GetClientRect(ui.downloads_window, &mut client);
+        GetClientRect(ui.overlay_window, &mut client);
         FillRect(dc, &client, ui.background_brush);
         fill_round_rect(dc, &client, SURFACE, 16, Some(DIVIDER));
         SetBkMode(dc, TRANSPARENT as i32);
@@ -2350,123 +2525,181 @@ fn format_bytes(bytes: i64) -> String {
     }
 }
 
-unsafe fn show_main_menu(window: HWND) {
+const MAIN_MENU_LAYOUT: &[(usize, bool)] = &[
+    (MENU_PRIVATE, false),
+    (MENU_RESTORE, false),
+    (MENU_BOOKMARKS, true),
+    (MENU_HISTORY, false),
+    (MENU_DOWNLOAD_PROMPT, false),
+    (MENU_CLEAR_HOUR, true),
+    (MENU_CLEAR_DAY, false),
+    (MENU_CLEAR_ALL, false),
+    (MENU_CLEAR_SITE, false),
+];
+const MAIN_MENU_ROW_HEIGHT: i32 = 34;
+const MAIN_MENU_SEPARATOR_HEIGHT: i32 = 9;
+
+struct MainMenuItem {
+    command: usize,
+    label: &'static str,
+    shortcut: &'static str,
+    checked: bool,
+}
+
+fn main_menu_height() -> i32 {
+    16 + MAIN_MENU_LAYOUT.len() as i32 * MAIN_MENU_ROW_HEIGHT
+        + MAIN_MENU_LAYOUT
+            .iter()
+            .filter(|(_, separator)| *separator)
+            .count() as i32
+            * MAIN_MENU_SEPARATOR_HEIGHT
+}
+
+fn main_menu_items(ui: &NativeUi) -> Vec<MainMenuItem> {
+    let preferences = lock_controller(&ui.controller).preferences();
+    MAIN_MENU_LAYOUT
+        .iter()
+        .map(|(command, _)| {
+            let (label, shortcut, checked) = match *command {
+                MENU_PRIVATE => ("Новое приватное окно", "Ctrl+Shift+N", false),
+                MENU_RESTORE => ("Восстановить закрытую вкладку", "Ctrl+Shift+T", false),
+                MENU_BOOKMARKS => (
+                    "Панель закладок",
+                    "Ctrl+Shift+B",
+                    preferences.show_bookmarks,
+                ),
+                MENU_HISTORY => ("Сохранять историю", "", preferences.save_history),
+                MENU_DOWNLOAD_PROMPT => (
+                    "Спрашивать путь загрузки",
+                    "",
+                    preferences.ask_download_path,
+                ),
+                MENU_CLEAR_HOUR => ("Очистить историю за час", "", false),
+                MENU_CLEAR_DAY => ("Очистить историю за сутки", "", false),
+                MENU_CLEAR_ALL => ("Очистить всю историю", "", false),
+                MENU_CLEAR_SITE => ("Очистить cookies, кэш и авторизацию", "", false),
+                _ => unreachable!(),
+            };
+            MainMenuItem {
+                command: *command,
+                label,
+                shortcut,
+                checked,
+            }
+        })
+        .collect()
+}
+
+fn main_menu_command_at(y: i32) -> Option<usize> {
+    let mut top = 8;
+    for (command, separator) in MAIN_MENU_LAYOUT {
+        if *separator {
+            top += MAIN_MENU_SEPARATOR_HEIGHT;
+        }
+        if (top..top + MAIN_MENU_ROW_HEIGHT).contains(&y) {
+            return Some(*command);
+        }
+        top += MAIN_MENU_ROW_HEIGHT;
+    }
+    None
+}
+
+unsafe fn draw_main_menu(ui: &NativeUi, dc: HDC) {
+    unsafe {
+        let mut client = RECT::default();
+        GetClientRect(ui.overlay_window, &mut client);
+        FillRect(dc, &client, ui.background_brush);
+        fill_round_rect(dc, &client, SURFACE, 16, Some(DIVIDER));
+        SetBkMode(dc, TRANSPARENT as i32);
+        let items = main_menu_items(ui);
+        let mut top = 8;
+        for ((_, separator), item) in MAIN_MENU_LAYOUT.iter().zip(items) {
+            if *separator {
+                let line = RECT {
+                    left: 14,
+                    top: top + MAIN_MENU_SEPARATOR_HEIGHT / 2,
+                    right: client.right - 14,
+                    bottom: top + MAIN_MENU_SEPARATOR_HEIGHT / 2 + 1,
+                };
+                let brush = CreateSolidBrush(DIVIDER);
+                FillRect(dc, &line, brush);
+                DeleteObject(brush as HGDIOBJ);
+                top += MAIN_MENU_SEPARATOR_HEIGHT;
+            }
+            let row = RECT {
+                left: 6,
+                top,
+                right: client.right - 6,
+                bottom: top + MAIN_MENU_ROW_HEIGHT,
+            };
+            if ui.menu_hover == item.command {
+                fill_round_rect(dc, &row, HOVER, 9, None);
+            }
+            if item.checked {
+                let check = RECT {
+                    left: 12,
+                    top: row.top,
+                    right: 36,
+                    bottom: row.bottom,
+                };
+                draw_icon(dc, &check, Icon::Check, ACCENT);
+            }
+            let label = RECT {
+                left: 38,
+                top: row.top,
+                right: client.right - if item.shortcut.is_empty() { 14 } else { 132 },
+                bottom: row.bottom,
+            };
+            draw_text(
+                dc,
+                item.label,
+                &label,
+                ui.title_font,
+                FOREGROUND,
+                DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            if !item.shortcut.is_empty() {
+                let shortcut = RECT {
+                    left: client.right - 130,
+                    top: row.top,
+                    right: client.right - 14,
+                    bottom: row.bottom,
+                };
+                draw_text(
+                    dc,
+                    item.shortcut,
+                    &shortcut,
+                    ui.small_font,
+                    SECONDARY,
+                    DT_RIGHT | DT_END_ELLIPSIS,
+                );
+            }
+            top += MAIN_MENU_ROW_HEIGHT;
+        }
+    }
+}
+
+unsafe fn execute_main_menu_command(window: HWND, command: usize) {
     unsafe {
         let Some(ui) = ui_mut(window) else { return };
         let controller = ui.controller.clone();
-        let preferences = lock_controller(&controller).preferences();
-        force_light_menus();
-        let menu = CreatePopupMenu();
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_PRIVATE,
-            wide("Новое приватное окно\tCtrl+Shift+N").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_RESTORE,
-            wide("Восстановить закрытую вкладку\tCtrl+Shift+T").as_ptr(),
-        );
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(
-            menu,
-            MF_STRING
-                | if preferences.show_bookmarks {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_BOOKMARKS,
-            wide("Панель закладок\tCtrl+Shift+B").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING
-                | if preferences.save_history {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_HISTORY,
-            wide("Сохранять историю").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING
-                | if preferences.ask_download_path {
-                    MF_CHECKED
-                } else {
-                    MF_UNCHECKED
-                },
-            MENU_DOWNLOAD_PROMPT,
-            wide("Спрашивать путь загрузки").as_ptr(),
-        );
-        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_CLEAR_HOUR,
-            wide("Очистить историю за час").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_CLEAR_DAY,
-            wide("Очистить историю за сутки").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_CLEAR_ALL,
-            wide("Очистить всю историю").as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_CLEAR_SITE,
-            wide("Очистить cookies, кэш и авторизацию").as_ptr(),
-        );
-        let point = cursor_position();
-        let command = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-            point.x,
-            point.y,
-            0,
-            window,
-            ptr::null(),
-        );
-        DestroyMenu(menu);
         match command {
-            value if value == MENU_PRIVATE as i32 => BrowserController::open_private_window(),
-            value if value == MENU_RESTORE as i32 => {
-                BrowserController::restore_closed_tab(&controller)
-            }
-            value if value == MENU_HISTORY as i32 => BrowserController::toggle_history(&controller),
-            value if value == MENU_BOOKMARKS as i32 => {
-                BrowserController::toggle_bookmarks_bar(&controller)
-            }
-            value if value == MENU_DOWNLOAD_PROMPT as i32 => {
-                BrowserController::toggle_download_prompt(&controller)
-            }
-            value if value == MENU_CLEAR_HOUR as i32 => {
-                BrowserController::clear_history(Some(3600))
-            }
-            value if value == MENU_CLEAR_DAY as i32 => {
-                BrowserController::clear_history(Some(86_400))
-            }
-            value if value == MENU_CLEAR_ALL as i32 => BrowserController::clear_history(None),
-            value
-                if value == MENU_CLEAR_SITE as i32
-                    && MessageBoxW(
-                        window,
-                        wide("Удалить cookies, кэш и сохранённые авторизации для всех сайтов?")
-                            .as_ptr(),
-                        wide("KOCKERS — очистка данных").as_ptr(),
-                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-                    ) == IDYES =>
+            MENU_PRIVATE => BrowserController::open_private_window(),
+            MENU_RESTORE => BrowserController::restore_closed_tab(&controller),
+            MENU_HISTORY => BrowserController::toggle_history(&controller),
+            MENU_BOOKMARKS => BrowserController::toggle_bookmarks_bar(&controller),
+            MENU_DOWNLOAD_PROMPT => BrowserController::toggle_download_prompt(&controller),
+            MENU_CLEAR_HOUR => BrowserController::clear_history(Some(3600)),
+            MENU_CLEAR_DAY => BrowserController::clear_history(Some(86_400)),
+            MENU_CLEAR_ALL => BrowserController::clear_history(None),
+            MENU_CLEAR_SITE
+                if MessageBoxW(
+                    window,
+                    wide("Удалить cookies, кэш и сохранённые авторизации для всех сайтов?")
+                        .as_ptr(),
+                    wide("KOCKERS — очистка данных").as_ptr(),
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                ) == IDYES =>
             {
                 BrowserController::clear_site_data();
             }
@@ -2743,5 +2976,29 @@ mod tests {
         assert!(overshot);
         assert_eq!(spring.value, 0.0);
         assert_eq!(spring.velocity, 0.0);
+    }
+
+    #[test]
+    fn panel_animation_finishes_at_the_target_in_160_ms() {
+        let now = Instant::now();
+        let mut offset = PanelOffset::new(12.0);
+        offset.set_target(0.0);
+        offset.started = now;
+        assert!(offset.step(now + Duration::from_millis(80)));
+        assert!(offset.value > 0.0 && offset.value < 12.0);
+        assert!(!offset.step(now + Duration::from_millis(160)));
+        assert_eq!(offset.value, 0.0);
+    }
+
+    #[test]
+    fn menu_hit_testing_skips_separators() {
+        assert_eq!(main_menu_command_at(8), Some(MENU_PRIVATE));
+        assert_eq!(main_menu_command_at(80), None);
+        assert_eq!(main_menu_command_at(85), Some(MENU_BOOKMARKS));
+        assert_eq!(
+            main_menu_command_at(main_menu_height() - 9),
+            Some(MENU_CLEAR_SITE)
+        );
+        assert_eq!(main_menu_command_at(main_menu_height()), None);
     }
 }

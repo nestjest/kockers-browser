@@ -1,4 +1,4 @@
-pub const APP_VERSION: &str = "0.2.2.1";
+pub const APP_VERSION: &str = "0.2.3";
 
 #[cfg(target_os = "windows")]
 mod app;
