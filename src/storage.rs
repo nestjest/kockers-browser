@@ -10,11 +10,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 const MAX_HISTORY: usize = 2_000;
 const MAX_CLOSED_TABS: usize = 20;
+const MAX_BOOKMARKS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Preferences {
     pub save_history: bool,
     pub ask_download_path: bool,
+    pub show_bookmarks: bool,
 }
 
 impl Default for Preferences {
@@ -22,8 +24,15 @@ impl Default for Preferences {
         Self {
             save_history: true,
             ask_download_path: false,
+            show_bookmarks: true,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    pub url: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +81,8 @@ pub fn load_preferences() -> Preferences {
             "history=1" => preferences.save_history = true,
             "ask_download=0" => preferences.ask_download_path = false,
             "ask_download=1" => preferences.ask_download_path = true,
+            "bookmarks=0" => preferences.show_bookmarks = false,
+            "bookmarks=1" => preferences.show_bookmarks = true,
             _ => {}
         }
     }
@@ -81,12 +92,53 @@ pub fn load_preferences() -> Preferences {
 pub fn save_preferences(preferences: Preferences) {
     if let Some(path) = data_dir().map(|path| path.join("preferences.txt")) {
         let text = format!(
-            "history={}\nask_download={}\n",
+            "history={}\nask_download={}\nbookmarks={}\n",
             u8::from(preferences.save_history),
-            u8::from(preferences.ask_download_path)
+            u8::from(preferences.ask_download_path),
+            u8::from(preferences.show_bookmarks)
         );
         write_atomic(&path, text.as_bytes());
     }
+}
+
+pub fn load_bookmarks() -> Vec<Bookmark> {
+    let Some(path) = data_dir().map(|path| path.join("bookmarks.txt")) else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut bookmarks = text
+        .lines()
+        .filter_map(|line| {
+            let (url, title) = line.split_once('\t')?;
+            let url = decode_field(url)?;
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return None;
+            }
+            let title = decode_field(title).unwrap_or_else(|| url.clone());
+            Some(Bookmark { url, title })
+        })
+        .collect::<Vec<_>>();
+    bookmarks.truncate(MAX_BOOKMARKS);
+    bookmarks
+}
+
+pub fn save_bookmarks(bookmarks: &[Bookmark]) {
+    let Some(path) = data_dir().map(|path| path.join("bookmarks.txt")) else {
+        return;
+    };
+    let mut text = String::new();
+    for bookmark in bookmarks.iter().take(MAX_BOOKMARKS) {
+        if bookmark.url.starts_with("https://") || bookmark.url.starts_with("http://") {
+            text.push_str(&format!(
+                "{}\t{}\n",
+                encode_field(&bookmark.url),
+                encode_field(&bookmark.title)
+            ));
+        }
+    }
+    write_atomic(&path, text.as_bytes());
 }
 
 pub fn load_session() -> Session {

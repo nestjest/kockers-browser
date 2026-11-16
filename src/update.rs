@@ -29,36 +29,10 @@ pub fn start() {
 }
 
 fn check_for_update() -> Result<(), String> {
-    let latest_url = format!("https://github.com/{REPOSITORY}/releases/latest");
-    let response = HttpResponse::open(&latest_url)?;
-    let final_url =
-        Url::parse(&response.final_url).map_err(|_| "Некорректный URL последнего релиза")?;
-    if final_url.scheme() != "https" || final_url.host_str() != Some("github.com") {
-        return Err("GitHub вернул неожиданный адрес релиза".to_owned());
-    }
-    let release_list = format!("/{REPOSITORY}/releases");
-    if final_url.path().trim_end_matches('/') == release_list {
-        write_status("Стабильных релизов пока нет");
-        return Ok(());
-    }
-    if !final_url
-        .path()
-        .starts_with(&format!("/{REPOSITORY}/releases/tag/"))
-    {
-        return Err("GitHub вернул неожиданный адрес релиза".to_owned());
-    }
-    let tag = final_url
-        .path_segments()
-        .and_then(|mut segments| segments.next_back())
-        .filter(|tag| !tag.is_empty())
-        .ok_or("В адресе релиза отсутствует тег")?;
-    if !tag
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
-    {
-        return Err("Тег релиза содержит недопустимые символы".to_owned());
-    }
-    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let releases_url = format!("https://github.com/{REPOSITORY}/releases.atom");
+    let feed = download_text(&releases_url, 512 * 1024)?;
+    let tag = latest_release_tag(&feed)?;
+    let version = tag.strip_prefix('v').unwrap_or(&tag);
     let candidate = Version::parse(version)?;
     if candidate <= Version::parse(CURRENT_VERSION)? {
         write_status(&format!(
@@ -84,6 +58,43 @@ fn check_for_update() -> Result<(), String> {
     write_status(&format!("Запуск проверенного обновления {version}"));
     launch_installer(&installer)?;
     Ok(())
+}
+
+fn latest_release_tag(feed: &str) -> Result<String, String> {
+    let prefix = format!("https://github.com/{REPOSITORY}/releases/tag/");
+    let mut latest: Option<(Version, String)> = None;
+    let mut remainder = feed;
+    while let Some(start) = remainder.find("href=\"") {
+        remainder = &remainder[start + 6..];
+        let Some(end) = remainder.find('"') else {
+            return Err("Некорректная ссылка в списке релизов".to_owned());
+        };
+        let link = &remainder[..end];
+        remainder = &remainder[end + 1..];
+        let Some(tag) = link.strip_prefix(&prefix) else {
+            continue;
+        };
+        if tag.is_empty()
+            || tag.contains('/')
+            || !tag.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+            })
+        {
+            continue;
+        }
+        let Ok(version) = Version::parse(tag.strip_prefix('v').unwrap_or(tag)) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|(current, _)| version > *current)
+        {
+            latest = Some((version, tag.to_owned()));
+        }
+    }
+    latest
+        .map(|(_, tag)| tag)
+        .ok_or_else(|| "GitHub не вернул ни одного корректного релиза".to_owned())
 }
 
 fn update_directory() -> Result<PathBuf, String> {
@@ -201,7 +212,6 @@ impl Drop for HttpHandle {
 
 struct HttpResponse {
     request: HttpHandle,
-    final_url: String,
 }
 
 impl HttpResponse {
@@ -277,8 +287,7 @@ impl HttpResponse {
             if status != 200 {
                 return Err(format!("GitHub вернул HTTP {status}"));
             }
-            let final_url = query_final_url(&request)?;
-            Ok(Self { request, final_url })
+            Ok(Self { request })
         }
     }
 
@@ -312,32 +321,6 @@ impl HttpResponse {
             sink(&buffer[..read as usize])?;
         }
         Ok(())
-    }
-}
-
-fn query_final_url(request: &HttpHandle) -> Result<String, String> {
-    unsafe {
-        let mut bytes = 0u32;
-        WinHttpQueryOption(request.0, WINHTTP_OPTION_URL, ptr::null_mut(), &mut bytes);
-        if bytes == 0 || bytes > 32 * 1024 {
-            return Err("Не удалось получить итоговый URL релиза".to_owned());
-        }
-        let mut buffer = vec![0u16; bytes as usize / 2 + 1];
-        if WinHttpQueryOption(
-            request.0,
-            WINHTTP_OPTION_URL,
-            buffer.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut bytes,
-        ) == 0
-        {
-            return Err(format!("WinHttpQueryOption: {}", windows_error()));
-        }
-        let length = bytes as usize / 2;
-        let length = buffer[..length]
-            .iter()
-            .position(|character| *character == 0)
-            .unwrap_or(length);
-        Ok(String::from_utf16(&buffer[..length]).map_err(|_| "Итоговый URL не UTF-16")?)
     }
 }
 
@@ -563,6 +546,13 @@ mod tests {
         assert!(Version::parse("1.0").is_err());
         assert!(Version::parse("1.0.0-").is_err());
         assert!(Version::parse("1.0.x").is_err());
+    }
+
+    #[test]
+    fn release_feed_includes_prereleases() {
+        let feed = r#"<feed><entry><link href="https://github.com/nestjest/kockers-browser/releases/tag/v0.2.2-alpha" /></entry><entry><link href="https://github.com/nestjest/kockers-browser/releases/tag/v0.2.1-alpha" /></entry></feed>"#;
+        assert_eq!(latest_release_tag(feed).as_deref(), Ok("v0.2.2-alpha"));
+        assert!(latest_release_tag("<feed></feed>").is_err());
     }
 
     #[test]

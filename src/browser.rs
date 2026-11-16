@@ -77,6 +77,7 @@ pub struct BrowserController {
     private: bool,
     request_context: Option<RequestContext>,
     preferences: storage::Preferences,
+    bookmarks: Vec<storage::Bookmark>,
     closing_window: bool,
 }
 
@@ -93,6 +94,7 @@ impl Default for BrowserController {
             private: false,
             request_context: None,
             preferences: storage::load_preferences(),
+            bookmarks: storage::load_bookmarks(),
             closing_window: false,
         }
     }
@@ -154,6 +156,18 @@ impl BrowserController {
 
     pub fn preferences(&self) -> storage::Preferences {
         self.preferences
+    }
+
+    pub fn bookmarks_snapshot(&self) -> Vec<storage::Bookmark> {
+        self.bookmarks.clone()
+    }
+
+    pub fn active_is_bookmarked(&self) -> bool {
+        self.active_tab().is_some_and(|tab| {
+            self.bookmarks
+                .iter()
+                .any(|bookmark| bookmark.url == tab.url)
+        })
     }
 
     pub fn active_url(&self) -> String {
@@ -564,6 +578,71 @@ impl BrowserController {
         storage::save_preferences(preferences);
     }
 
+    pub fn toggle_bookmarks_bar(controller: &SharedController) {
+        let (window, preferences) = {
+            let mut state = lock_controller(controller);
+            state.preferences.show_bookmarks = !state.preferences.show_bookmarks;
+            (state.window, state.preferences)
+        };
+        storage::save_preferences(preferences);
+        platform::refresh_bookmarks(window);
+    }
+
+    pub fn toggle_bookmark(controller: &SharedController) {
+        let (window, bookmarks) = {
+            let mut state = lock_controller(controller);
+            let Some(tab) = state.active_tab() else {
+                return;
+            };
+            if !tab.url.starts_with("https://") && !tab.url.starts_with("http://") {
+                return;
+            }
+            let url = tab.url.clone();
+            let title = if tab.title.is_empty() {
+                url.clone()
+            } else {
+                tab.title.clone()
+            };
+            if let Some(index) = state
+                .bookmarks
+                .iter()
+                .position(|bookmark| bookmark.url == url)
+            {
+                state.bookmarks.remove(index);
+            } else if state.bookmarks.len() < 200 {
+                state.bookmarks.push(storage::Bookmark { url, title });
+            } else {
+                return;
+            }
+            (state.window, state.bookmarks.clone())
+        };
+        storage::save_bookmarks(&bookmarks);
+        platform::refresh_bookmarks(window);
+    }
+
+    pub fn open_bookmark(controller: &SharedController, index: usize) {
+        let url = lock_controller(controller)
+            .bookmarks
+            .get(index)
+            .map(|bookmark| bookmark.url.clone());
+        if let Some(url) = url {
+            Self::load_url(controller, &url);
+        }
+    }
+
+    pub fn remove_bookmark(controller: &SharedController, index: usize) {
+        let (window, bookmarks) = {
+            let mut state = lock_controller(controller);
+            if index >= state.bookmarks.len() {
+                return;
+            }
+            state.bookmarks.remove(index);
+            (state.window, state.bookmarks.clone())
+        };
+        storage::save_bookmarks(&bookmarks);
+        platform::refresh_bookmarks(window);
+    }
+
     pub fn clear_history(seconds: Option<u64>) {
         storage::clear_history_since(seconds);
     }
@@ -835,11 +914,12 @@ fn create_browser_with_client(
     client: &mut Client,
 ) {
     let (width, height) = unsafe { platform::client_size(window) };
+    let content_top = platform::content_top(window);
     let bounds = Rect {
         x: 0,
-        y: platform::TOOLBAR_HEIGHT,
+        y: content_top,
         width,
-        height: (height - platform::TOOLBAR_HEIGHT).max(0),
+        height: (height - content_top).max(0),
     };
     let window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
@@ -1367,6 +1447,8 @@ wrap_keyboard_handler! {
             match event.windows_key_code {
                 key if key == 'L' as i32 && control => unsafe { platform::focus_address(window) },
                 key if key == 'R' as i32 && control => BrowserController::reload(&self.controller),
+                key if key == 'D' as i32 && control => BrowserController::toggle_bookmark(&self.controller),
+                key if key == 'B' as i32 && control && shift => BrowserController::toggle_bookmarks_bar(&self.controller),
                 key if key == 'T' as i32 && control && shift => BrowserController::restore_closed_tab(&self.controller),
                 key if key == 'T' as i32 && control => BrowserController::new_tab(&self.controller, pages::start_page_url(), false),
                 key if key == 'W' as i32 && control => BrowserController::close_active_tab(&self.controller),
