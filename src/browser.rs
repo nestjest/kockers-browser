@@ -8,10 +8,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::HWND,
-    UI::{
-        Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
-        WindowsAndMessaging::DestroyWindow,
-    },
+    UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
 };
 
 pub type SharedController = Arc<Mutex<BrowserController>>;
@@ -336,7 +333,7 @@ impl BrowserController {
         }
     }
 
-    fn finish_tab_close(controller: &SharedController, id: u64) {
+    pub(crate) fn finish_tab_close(controller: &SharedController, id: u64) {
         let (window, was_active, closing_window, empty) = {
             let mut state = lock_controller(controller);
             let Some(index) = state.tabs.iter().position(|tab| tab.id == id) else {
@@ -376,10 +373,12 @@ impl BrowserController {
                 Self::new_tab(controller, pages::start_page_url(), false);
             }
         } else {
-            if was_active
-                && !closing_window
-                && let Some(active) = lock_controller(controller).active
-            {
+            let active = if was_active && !closing_window {
+                lock_controller(controller).active
+            } else {
+                None
+            };
+            if let Some(active) = active {
                 Self::activate_tab(controller, active);
             }
             platform::refresh_tabs(window);
@@ -1088,15 +1087,16 @@ wrap_life_span_handler! {
         }
 
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
-            let closing_window = lock_controller(&self.controller).closing_window;
+            let (window, closing_window) = {
+                let state = lock_controller(&self.controller);
+                (state.window, state.closing_window)
+            };
             if closing_window {
                 return 0;
             }
             if let Some(host) = browser.and_then(|browser| browser.host()) {
                 let handle = host.window_handle().0.cast::<std::ffi::c_void>();
-                if !handle.is_null() {
-                    unsafe { DestroyWindow(handle) };
-                }
+                platform::post_browser_destroy(window, handle);
             }
             1
         }
@@ -1127,16 +1127,17 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
-            let id = {
+            let (window, closing_window, id) = {
                 let state = lock_controller(&self.controller);
-                browser.and_then(|browser| {
+                let id = browser.and_then(|browser| {
                     state.tabs.iter().find(|tab| {
                         tab.browser.as_ref().is_some_and(|current| current.identifier() == browser.identifier())
                     }).map(|tab| tab.id)
-                })
+                });
+                (state.window, state.closing_window, id)
             };
-            if let Some(id) = id {
-                BrowserController::finish_tab_close(&self.controller, id);
+            if !closing_window && let Some(id) = id {
+                platform::post_tab_closed(window, id);
             }
         }
     }

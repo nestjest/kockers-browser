@@ -50,6 +50,9 @@ const ID_ADDRESS: usize = 103;
 const ID_DOWNLOAD_OVERLAY: usize = 110;
 const ICON_ID: usize = 1;
 const ANIMATION_TIMER: usize = 1;
+const WM_CLOSE_TAB: u32 = WM_APP + 1;
+const WM_FINALIZE_TAB: u32 = WM_APP + 2;
+const WM_DESTROY_TAB: u32 = WM_APP + 3;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWCP_ROUND: u32 = 2;
 const MENU_PRIVATE: usize = 2001;
@@ -126,7 +129,6 @@ struct NativeUi {
     surface_brush: HBRUSH,
     font: HFONT,
     small_font: HFONT,
-    icon_font: HFONT,
     title_font: HFONT,
     logo_icon: HICON,
     current_url: String,
@@ -159,7 +161,6 @@ impl NativeUi {
             surface_brush: ptr::null_mut(),
             font: ptr::null_mut(),
             small_font: ptr::null_mut(),
-            icon_font: ptr::null_mut(),
             title_font: ptr::null_mut(),
             logo_icon: ptr::null_mut(),
             current_url: String::new(),
@@ -188,13 +189,11 @@ impl NativeUi {
             self.surface_brush = CreateSolidBrush(SURFACE);
             self.font = create_font(16, "Segoe UI");
             self.small_font = create_font(12, "Segoe UI");
-            self.icon_font = create_font(18, "Segoe UI Symbol");
             self.title_font = create_font(13, "Segoe UI");
             if self.background_brush.is_null()
                 || self.surface_brush.is_null()
                 || self.font.is_null()
                 || self.small_font.is_null()
-                || self.icon_font.is_null()
                 || self.title_font.is_null()
             {
                 return Err("Не удалось создать графические ресурсы панели.".to_owned());
@@ -305,8 +304,8 @@ impl NativeUi {
         let (width, height) = unsafe { client_size(self.window) };
         self.layout_tabs();
         unsafe {
-            MoveWindow(self.address, 184, 57, (width - 336).max(100), 40, 1);
-            let region = CreateRoundRectRgn(0, 0, (width - 336).max(100) + 1, 41, 40, 40);
+            MoveWindow(self.address, 192, 62, (width - 352).max(100), 28, 1);
+            let region = CreateRoundRectRgn(0, 0, (width - 352).max(100) + 1, 29, 28, 28);
             if !region.is_null() {
                 SetWindowRgn(self.address, region, 1);
             }
@@ -375,6 +374,7 @@ impl NativeUi {
         self.can_go_back = back;
         self.can_go_forward = forward;
         self.is_loading = loading;
+        self.address_editing = false;
         self.update_address(&url);
         unsafe { InvalidateRect(self.window, ptr::null(), 0) };
     }
@@ -479,7 +479,7 @@ impl NativeUi {
             if x >= width - 138 {
                 return Hit::Minimize;
             }
-            if x >= width - 180 && x < width - 138 {
+            if point_in_rect(x, y, &new_tab_rect(self)) {
                 return Hit::NewTab;
             }
             for visual in &self.tabs {
@@ -492,19 +492,18 @@ impl NativeUi {
                     return Hit::Tab(visual.tab.id);
                 }
             }
-        } else if (54..101).contains(&y) {
-            match x {
-                14..=49 => return Hit::Back,
-                56..=91 => return Hit::Forward,
-                98..=133 => return Hit::Reload,
-                140..=175 => return Hit::Home,
-                _ => {}
-            }
-            if x >= width - 102 && x < width - 56 {
-                return Hit::Downloads;
-            }
-            if x >= width - 50 {
-                return Hit::Menu;
+        } else if (TAB_HEIGHT..TOOLBAR_HEIGHT).contains(&y) {
+            for (hit, rect) in [
+                (Hit::Back, toolbar_rect(12)),
+                (Hit::Forward, toolbar_rect(56)),
+                (Hit::Reload, toolbar_rect(100)),
+                (Hit::Home, toolbar_rect(144)),
+                (Hit::Downloads, toolbar_rect(width - 104)),
+                (Hit::Menu, toolbar_rect(width - 52)),
+            ] {
+                if point_in_rect(x, y, &rect) {
+                    return hit;
+                }
             }
         }
         Hit::None
@@ -538,7 +537,9 @@ impl NativeUi {
                 PostMessageW(self.window, WM_CLOSE, 0, 0);
             },
             Hit::Tab(id) => BrowserController::activate_tab(&self.controller, id),
-            Hit::TabClose(id) => BrowserController::close_tab(&self.controller, id),
+            Hit::TabClose(id) => unsafe {
+                PostMessageW(self.window, WM_CLOSE_TAB, id as WPARAM, 0);
+            },
             Hit::None => {}
         }
     }
@@ -557,7 +558,6 @@ impl NativeUi {
                 self.surface_brush as HGDIOBJ,
                 self.font as HGDIOBJ,
                 self.small_font as HGDIOBJ,
-                self.icon_font as HGDIOBJ,
                 self.title_font as HGDIOBJ,
             ] {
                 if !object.is_null() {
@@ -807,6 +807,18 @@ pub(crate) fn finish_window_close(window: HWND) {
     }
 }
 
+pub(crate) fn post_tab_closed(window: HWND, id: u64) {
+    if !window.is_null() {
+        unsafe { PostMessageW(window, WM_FINALIZE_TAB, id as WPARAM, 0) };
+    }
+}
+
+pub(crate) fn post_browser_destroy(window: HWND, browser: HWND) {
+    if !window.is_null() && !browser.is_null() {
+        unsafe { PostMessageW(window, WM_DESTROY_TAB, browser as WPARAM, 0) };
+    }
+}
+
 pub fn show_direct_launch_error() {
     show_fatal_error(
         "Для sandbox-сборки запускайте kockers_browser.exe из каталога target/bundle. Его создаёт команда kockers-bundle.",
@@ -1044,7 +1056,28 @@ unsafe extern "system" fn window_proc(
                 if let Some(ui) = ui_mut(window)
                     && let Hit::Tab(id) | Hit::TabClose(id) = ui.hit_test(x, y)
                 {
-                    BrowserController::close_tab(&ui.controller, id);
+                    PostMessageW(window, WM_CLOSE_TAB, id as WPARAM, 0);
+                }
+                return 0;
+            }
+            WM_CLOSE_TAB => {
+                if let Some(ui) = ui_mut(window) {
+                    let controller = ui.controller.clone();
+                    BrowserController::close_tab(&controller, wparam as u64);
+                }
+                return 0;
+            }
+            WM_DESTROY_TAB => {
+                let browser = wparam as HWND;
+                if !browser.is_null() {
+                    DestroyWindow(browser);
+                }
+                return 0;
+            }
+            WM_FINALIZE_TAB => {
+                if let Some(ui) = ui_mut(window) {
+                    let controller = ui.controller.clone();
+                    BrowserController::finish_tab_close(&controller, wparam as u64);
                 }
                 return 0;
             }
@@ -1356,6 +1389,44 @@ unsafe fn non_client_hit_test(window: HWND, lparam: LPARAM) -> LRESULT {
     }
 }
 
+fn point_in_rect(x: i32, y: i32, rect: &RECT) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+fn toolbar_rect(left: i32) -> RECT {
+    RECT {
+        left,
+        top: 56,
+        right: left + 40,
+        bottom: 96,
+    }
+}
+
+fn new_tab_rect(ui: &NativeUi) -> RECT {
+    let (width, _) = unsafe { client_size(ui.window) };
+    let after_tabs = ui
+        .tabs
+        .last()
+        .map(|visual| visual.x.value + visual.width + 6.0)
+        .unwrap_or(52.0);
+    let left = (after_tabs.round() as i32).min((width - 182).max(52));
+    RECT {
+        left,
+        top: 4,
+        right: left + 36,
+        bottom: 40,
+    }
+}
+
+fn address_rect(width: i32) -> RECT {
+    RECT {
+        left: 192,
+        top: 56,
+        right: (width - 160).max(292),
+        bottom: 96,
+    }
+}
+
 unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
     unsafe {
         let (width, _) = client_size(ui.window);
@@ -1381,6 +1452,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             ptr::null_mut(),
             DI_NORMAL,
         );
+        fill_round_rect(memory, &address_rect(width), SURFACE, 20, None);
         for visual in &ui.tabs {
             draw_tab(ui, memory, visual);
         }
@@ -1388,91 +1460,53 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             memory,
             ui,
             Hit::NewTab,
-            RECT {
-                left: width - 176,
-                top: 7,
-                right: width - 142,
-                bottom: 37,
-            },
-            "+",
+            new_tab_rect(ui),
+            Icon::NewTab,
             true,
         );
         draw_button(
             memory,
             ui,
             Hit::Back,
-            RECT {
-                left: 14,
-                top: 59,
-                right: 48,
-                bottom: 95,
-            },
-            "←",
+            toolbar_rect(12),
+            Icon::Back,
             ui.can_go_back,
         );
         draw_button(
             memory,
             ui,
             Hit::Forward,
-            RECT {
-                left: 56,
-                top: 59,
-                right: 90,
-                bottom: 95,
-            },
-            "→",
+            toolbar_rect(56),
+            Icon::Forward,
             ui.can_go_forward,
         );
         draw_button(
             memory,
             ui,
             Hit::Reload,
-            RECT {
-                left: 98,
-                top: 59,
-                right: 132,
-                bottom: 95,
+            toolbar_rect(100),
+            if ui.is_loading {
+                Icon::Close
+            } else {
+                Icon::Reload
             },
-            if ui.is_loading { "×" } else { "↻" },
             true,
         );
-        draw_button(
-            memory,
-            ui,
-            Hit::Home,
-            RECT {
-                left: 140,
-                top: 59,
-                right: 174,
-                bottom: 95,
-            },
-            "⌂",
-            true,
-        );
+        draw_button(memory, ui, Hit::Home, toolbar_rect(144), Icon::Home, true);
         draw_button(
             memory,
             ui,
             Hit::Downloads,
-            RECT {
-                left: width - 100,
-                top: 59,
-                right: width - 58,
-                bottom: 95,
-            },
-            "↓",
+            toolbar_rect(width - 104),
+            Icon::Download,
             true,
         );
         draw_button(
             memory,
             ui,
             Hit::Menu,
-            RECT {
-                left: width - 50,
-                top: 59,
-                right: width - 14,
-                bottom: 95,
-            },
-            "⋮",
+            toolbar_rect(width - 52),
+            Icon::Menu,
             true,
         );
         draw_button(
@@ -1485,7 +1519,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
                 right: width - 92,
                 bottom: TAB_HEIGHT,
             },
-            "—",
+            Icon::Minimize,
             true,
         );
         draw_button(
@@ -1499,9 +1533,9 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
                 bottom: TAB_HEIGHT,
             },
             if IsZoomed(ui.window) != 0 {
-                "❐"
+                Icon::Restore
             } else {
-                "□"
+                Icon::Maximize
             },
             true,
         );
@@ -1551,8 +1585,8 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
             return;
         }
         let mut title_rect = rect;
-        title_rect.left += 13;
-        title_rect.right -= 29;
+        title_rect.left += if visual.tab.loading { 28 } else { 13 };
+        title_rect.right -= 34;
         draw_text(
             dc,
             &visual.tab.title,
@@ -1563,38 +1597,53 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
         );
         if visual.tab.loading {
             let indicator = RECT {
-                left: rect.left + 7,
-                top: rect.top + 5,
-                right: rect.left + 18,
-                bottom: rect.top + 17,
+                left: rect.left + 6,
+                top: rect.top + 8,
+                right: rect.left + 24,
+                bottom: rect.top + 26,
             };
             draw_text(dc, "•", &indicator, ui.small_font, ACCENT, DT_CENTER);
         }
         let close = RECT {
-            left: rect.right - 29,
-            top: 11,
-            right: rect.right - 5,
+            left: rect.right - 32,
+            top: 9,
+            right: rect.right - 6,
             bottom: 35,
         };
         if ui.hover == Hit::TabClose(visual.tab.id) {
             fill_round_rect(dc, &close, HOVER, 8, None);
         }
-        draw_text(dc, "×", &close, ui.icon_font, SECONDARY, DT_CENTER);
+        draw_icon(dc, &close, Icon::Close, SECONDARY);
     }
 }
 
-unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, text: &str, enabled: bool) {
+#[derive(Clone, Copy)]
+enum Icon {
+    Back,
+    Forward,
+    Reload,
+    Home,
+    NewTab,
+    Download,
+    Menu,
+    Minimize,
+    Maximize,
+    Restore,
+    Pause,
+    Play,
+    Close,
+}
+
+unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, enabled: bool) {
     unsafe {
         if ui.hover == hit || ui.pressed == hit {
-            fill_round_rect(dc, &rect, HOVER, 11, None);
+            fill_round_rect(dc, &rect, HOVER, 12, None);
         }
-        draw_text(
+        draw_icon(
             dc,
-            text,
             &rect,
-            ui.icon_font,
+            icon,
             if enabled { FOREGROUND } else { SECONDARY },
-            DT_CENTER,
         );
     }
 }
@@ -1607,24 +1656,348 @@ unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
             right: width,
             bottom: TAB_HEIGHT,
         };
-        if ui.hover == Hit::CloseWindow || ui.pressed == Hit::CloseWindow {
+        let hovered = ui.hover == Hit::CloseWindow || ui.pressed == Hit::CloseWindow;
+        if hovered {
             let brush = CreateSolidBrush(CLOSE_HOVER);
             FillRect(dc, &rect, brush);
             DeleteObject(brush as HGDIOBJ);
         }
-        draw_text(
+        draw_icon(
             dc,
-            "×",
             &rect,
-            ui.icon_font,
-            if ui.hover == Hit::CloseWindow {
-                SURFACE
-            } else {
-                FOREGROUND
-            },
-            DT_CENTER,
+            Icon::Close,
+            if hovered { SURFACE } else { FOREGROUND },
         );
     }
+}
+
+unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
+    unsafe {
+        let size = 20;
+        let rect = RECT {
+            left: (target.left + target.right - size) / 2,
+            top: (target.top + target.bottom - size) / 2,
+            right: (target.left + target.right + size) / 2,
+            bottom: (target.top + target.bottom + size) / 2,
+        };
+        let pen = CreatePen(PS_SOLID, 2, color);
+        let brush = CreateSolidBrush(color);
+        let old_pen = SelectObject(dc, pen as HGDIOBJ);
+        let old_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        let l = rect.left;
+        let t = rect.top;
+        match icon {
+            Icon::Back => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 14,
+                            y: t + 4,
+                        },
+                        POINT {
+                            x: l + 6,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 14,
+                            y: t + 16,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 7,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 18,
+                            y: t + 10,
+                        },
+                    ],
+                );
+            }
+            Icon::Forward => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 6, y: t + 4 },
+                        POINT {
+                            x: l + 14,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 6,
+                            y: t + 16,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 2,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 13,
+                            y: t + 10,
+                        },
+                    ],
+                );
+            }
+            Icon::Reload => {
+                Arc(
+                    dc,
+                    l + 3,
+                    t + 3,
+                    l + 17,
+                    t + 17,
+                    l + 16,
+                    t + 7,
+                    l + 6,
+                    t + 4,
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 4, y: t + 3 },
+                        POINT { x: l + 4, y: t + 9 },
+                        POINT {
+                            x: l + 10,
+                            y: t + 9,
+                        },
+                    ],
+                );
+            }
+            Icon::Home => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 3,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 10,
+                            y: t + 3,
+                        },
+                        POINT {
+                            x: l + 17,
+                            y: t + 10,
+                        },
+                    ],
+                );
+                Rectangle(dc, l + 6, t + 9, l + 15, t + 18);
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 10,
+                            y: t + 13,
+                        },
+                        POINT {
+                            x: l + 10,
+                            y: t + 18,
+                        },
+                    ],
+                );
+            }
+            Icon::NewTab => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 10,
+                            y: t + 4,
+                        },
+                        POINT {
+                            x: l + 10,
+                            y: t + 16,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 4,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 16,
+                            y: t + 10,
+                        },
+                    ],
+                );
+            }
+            Icon::Download => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 10,
+                            y: t + 3,
+                        },
+                        POINT {
+                            x: l + 10,
+                            y: t + 13,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 5, y: t + 9 },
+                        POINT {
+                            x: l + 10,
+                            y: t + 14,
+                        },
+                        POINT {
+                            x: l + 15,
+                            y: t + 9,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 4,
+                            y: t + 17,
+                        },
+                        POINT {
+                            x: l + 16,
+                            y: t + 17,
+                        },
+                    ],
+                );
+            }
+            Icon::Menu => {
+                SelectObject(dc, brush as HGDIOBJ);
+                for y in [t + 4, t + 10, t + 16] {
+                    Ellipse(dc, l + 8, y - 2, l + 12, y + 2);
+                }
+            }
+            Icon::Minimize => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 4,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 16,
+                            y: t + 10,
+                        },
+                    ],
+                );
+            }
+            Icon::Maximize => {
+                Rectangle(dc, l + 4, t + 4, l + 16, t + 16);
+            }
+            Icon::Restore => {
+                Rectangle(dc, l + 3, t + 7, l + 13, t + 17);
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 7, y: t + 7 },
+                        POINT { x: l + 7, y: t + 3 },
+                        POINT {
+                            x: l + 17,
+                            y: t + 3,
+                        },
+                        POINT {
+                            x: l + 17,
+                            y: t + 13,
+                        },
+                        POINT {
+                            x: l + 13,
+                            y: t + 13,
+                        },
+                    ],
+                );
+            }
+            Icon::Pause => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 7, y: t + 5 },
+                        POINT {
+                            x: l + 7,
+                            y: t + 15,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 13,
+                            y: t + 5,
+                        },
+                        POINT {
+                            x: l + 13,
+                            y: t + 15,
+                        },
+                    ],
+                );
+            }
+            Icon::Play => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 6, y: t + 4 },
+                        POINT {
+                            x: l + 15,
+                            y: t + 10,
+                        },
+                        POINT {
+                            x: l + 6,
+                            y: t + 16,
+                        },
+                        POINT { x: l + 6, y: t + 4 },
+                    ],
+                );
+            }
+            Icon::Close => {
+                icon_lines(
+                    dc,
+                    &[
+                        POINT { x: l + 5, y: t + 5 },
+                        POINT {
+                            x: l + 15,
+                            y: t + 15,
+                        },
+                    ],
+                );
+                icon_lines(
+                    dc,
+                    &[
+                        POINT {
+                            x: l + 15,
+                            y: t + 5,
+                        },
+                        POINT {
+                            x: l + 5,
+                            y: t + 15,
+                        },
+                    ],
+                );
+            }
+        }
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen as HGDIOBJ);
+        DeleteObject(brush as HGDIOBJ);
+    }
+}
+
+unsafe fn icon_lines(dc: HDC, points: &[POINT]) {
+    unsafe { Polyline(dc, points.as_ptr(), points.len() as i32) };
 }
 
 unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
@@ -1654,7 +2027,7 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
             right: client.right - 10,
             bottom: 44,
         };
-        draw_text(dc, "×", &close, ui.icon_font, SECONDARY, DT_CENTER);
+        draw_icon(dc, &close, Icon::Close, SECONDARY);
         if ui.downloads.is_empty() {
             let empty = RECT {
                 left: 20,
@@ -1719,17 +2092,15 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
                 DownloadStatus::Complete => {
                     draw_text(dc, "Открыть", &action, ui.small_font, ACCENT, DT_CENTER)
                 }
-                DownloadStatus::InProgress | DownloadStatus::Paused => draw_text(
+                DownloadStatus::InProgress | DownloadStatus::Paused => draw_icon(
                     dc,
-                    if download.status == DownloadStatus::Paused {
-                        "▶"
-                    } else {
-                        "Ⅱ"
-                    },
                     &action,
-                    ui.icon_font,
+                    if download.status == DownloadStatus::Paused {
+                        Icon::Play
+                    } else {
+                        Icon::Pause
+                    },
                     FOREGROUND,
-                    DT_CENTER,
                 ),
                 _ => {}
             }
@@ -1743,7 +2114,7 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
                     right: client.right - 14,
                     bottom: top + 52,
                 };
-                draw_text(dc, "×", &cancel, ui.icon_font, SECONDARY, DT_CENTER);
+                draw_icon(dc, &cancel, Icon::Close, SECONDARY);
             }
             if matches!(
                 download.status,
@@ -1807,7 +2178,7 @@ unsafe fn draw_text(dc: HDC, text: &str, rect: &RECT, font: HFONT, color: COLORR
             text.as_mut_ptr(),
             text.len() as i32 - 1,
             &mut rect,
-            flags | DT_SINGLELINE,
+            flags | DT_SINGLELINE | DT_VCENTER,
         );
     }
 }
