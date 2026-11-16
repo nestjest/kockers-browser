@@ -2,7 +2,7 @@ use crate::browser::{
     BrowserController, DownloadSnapshot, DownloadStatus, SharedController, TabSnapshot,
     lock_controller,
 };
-use crate::{storage, ui::pages};
+use crate::{storage, ui::pages, update};
 use std::{
     ffi::c_void,
     iter, mem,
@@ -70,6 +70,7 @@ const ID_OVERLAY: usize = 110;
 const ICON_ID: usize = 1;
 const TAB_ICON_ID: usize = 2;
 const ANIMATION_TIMER: usize = 1;
+const UPDATE_TIMER: usize = 2;
 const WM_CLOSE_TAB: u32 = WM_APP + 1;
 const WM_FINALIZE_TAB: u32 = WM_APP + 2;
 const WM_DESTROY_TAB: u32 = WM_APP + 3;
@@ -87,6 +88,7 @@ const MENU_CLEAR_DAY: usize = 2006;
 const MENU_CLEAR_ALL: usize = 2007;
 const MENU_CLEAR_SITE: usize = 2008;
 const MENU_BOOKMARKS: usize = 2009;
+const MENU_UPDATE: usize = 2010;
 const MENU_PIN: usize = 2101;
 const MENU_CLOSE_TAB: usize = 2102;
 const MENU_REMOVE_BOOKMARK: usize = 2201;
@@ -216,6 +218,8 @@ struct NativeUi {
     panel_open: bool,
     panel_visible: bool,
     menu_hover: usize,
+    update_status: update::Status,
+    update_timer_running: bool,
     hover: Hit,
     pressed: Hit,
     drag_tab: Option<u64>,
@@ -265,6 +269,8 @@ impl NativeUi {
             panel_open: false,
             panel_visible: false,
             menu_hover: 0,
+            update_status: update::snapshot(),
+            update_timer_running: false,
             hover: Hit::None,
             pressed: Hit::None,
             drag_tab: None,
@@ -600,6 +606,7 @@ impl NativeUi {
         self.panel_visible = true;
         self.panel_offset = PanelOffset::new(12.0);
         self.panel_offset.set_target(0.0);
+        self.refresh_update();
         self.layout_panel();
         unsafe {
             SetWindowPos(
@@ -621,6 +628,31 @@ impl NativeUi {
             self.panel_open = false;
             self.panel_offset.set_target(12.0);
             self.update_animation_timer();
+        }
+        self.update_update_timer();
+    }
+
+    fn refresh_update(&mut self) {
+        self.update_status = update::snapshot();
+        if self.panel == Some(PanelKind::Menu) {
+            self.layout_panel();
+            unsafe { InvalidateRect(self.overlay_window, ptr::null(), 0) };
+        }
+        self.update_update_timer();
+    }
+
+    fn update_update_timer(&mut self) {
+        let needed = self.panel_open
+            && self.panel == Some(PanelKind::Menu)
+            && self.update_status.is_active();
+        unsafe {
+            if needed && !self.update_timer_running {
+                SetTimer(self.window, UPDATE_TIMER, 200, None);
+                self.update_timer_running = true;
+            } else if !needed && self.update_timer_running {
+                KillTimer(self.window, UPDATE_TIMER);
+                self.update_timer_running = false;
+            }
         }
     }
 
@@ -1246,6 +1278,12 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
+            WM_TIMER if wparam == UPDATE_TIMER => {
+                if let Some(ui) = ui_mut(window) {
+                    ui.refresh_update();
+                }
+                return 0;
+            }
             WM_MOUSEMOVE => {
                 let x = low_word(lparam) as i32;
                 let y = high_word(lparam) as i32;
@@ -1536,8 +1574,13 @@ unsafe extern "system" fn overlay_proc(
                     match ui.panel {
                         Some(PanelKind::Menu) => {
                             if let Some(command) = main_menu_command_at(y) {
-                                ui.close_panels();
+                                if command != MENU_UPDATE {
+                                    ui.close_panels();
+                                }
                                 execute_main_menu_command(parent, command);
+                                if command == MENU_UPDATE {
+                                    ui.refresh_update();
+                                }
                             }
                         }
                         Some(PanelKind::Downloads) => {
@@ -2535,24 +2578,39 @@ const MAIN_MENU_LAYOUT: &[(usize, bool)] = &[
     (MENU_CLEAR_DAY, false),
     (MENU_CLEAR_ALL, false),
     (MENU_CLEAR_SITE, false),
+    (MENU_UPDATE, true),
 ];
 const MAIN_MENU_ROW_HEIGHT: i32 = 34;
+const UPDATE_MENU_ROW_HEIGHT: i32 = 66;
 const MAIN_MENU_SEPARATOR_HEIGHT: i32 = 9;
 
 struct MainMenuItem {
     command: usize,
-    label: &'static str,
+    label: String,
     shortcut: &'static str,
     checked: bool,
 }
 
+fn main_menu_row_height(command: usize) -> i32 {
+    if command == MENU_UPDATE {
+        UPDATE_MENU_ROW_HEIGHT
+    } else {
+        MAIN_MENU_ROW_HEIGHT
+    }
+}
+
 fn main_menu_height() -> i32 {
-    16 + MAIN_MENU_LAYOUT.len() as i32 * MAIN_MENU_ROW_HEIGHT
-        + MAIN_MENU_LAYOUT
-            .iter()
-            .filter(|(_, separator)| *separator)
-            .count() as i32
-            * MAIN_MENU_SEPARATOR_HEIGHT
+    16 + MAIN_MENU_LAYOUT
+        .iter()
+        .map(|(command, separator)| {
+            main_menu_row_height(*command)
+                + if *separator {
+                    MAIN_MENU_SEPARATOR_HEIGHT
+                } else {
+                    0
+                }
+        })
+        .sum::<i32>()
 }
 
 fn main_menu_items(ui: &NativeUi) -> Vec<MainMenuItem> {
@@ -2561,23 +2619,28 @@ fn main_menu_items(ui: &NativeUi) -> Vec<MainMenuItem> {
         .iter()
         .map(|(command, _)| {
             let (label, shortcut, checked) = match *command {
-                MENU_PRIVATE => ("Новое приватное окно", "Ctrl+Shift+N", false),
-                MENU_RESTORE => ("Восстановить закрытую вкладку", "Ctrl+Shift+T", false),
+                MENU_PRIVATE => ("Новое приватное окно".to_owned(), "Ctrl+Shift+N", false),
+                MENU_RESTORE => (
+                    "Восстановить закрытую вкладку".to_owned(),
+                    "Ctrl+Shift+T",
+                    false,
+                ),
                 MENU_BOOKMARKS => (
-                    "Панель закладок",
+                    "Панель закладок".to_owned(),
                     "Ctrl+Shift+B",
                     preferences.show_bookmarks,
                 ),
-                MENU_HISTORY => ("Сохранять историю", "", preferences.save_history),
+                MENU_HISTORY => ("Сохранять историю".to_owned(), "", preferences.save_history),
                 MENU_DOWNLOAD_PROMPT => (
-                    "Спрашивать путь загрузки",
+                    "Спрашивать путь загрузки".to_owned(),
                     "",
                     preferences.ask_download_path,
                 ),
-                MENU_CLEAR_HOUR => ("Очистить историю за час", "", false),
-                MENU_CLEAR_DAY => ("Очистить историю за сутки", "", false),
-                MENU_CLEAR_ALL => ("Очистить всю историю", "", false),
-                MENU_CLEAR_SITE => ("Очистить cookies, кэш и авторизацию", "", false),
+                MENU_CLEAR_HOUR => ("Очистить историю за час".to_owned(), "", false),
+                MENU_CLEAR_DAY => ("Очистить историю за сутки".to_owned(), "", false),
+                MENU_CLEAR_ALL => ("Очистить всю историю".to_owned(), "", false),
+                MENU_CLEAR_SITE => ("Очистить cookies, кэш и авторизацию".to_owned(), "", false),
+                MENU_UPDATE => (update_menu_label(&ui.update_status), "", false),
                 _ => unreachable!(),
             };
             MainMenuItem {
@@ -2590,16 +2653,67 @@ fn main_menu_items(ui: &NativeUi) -> Vec<MainMenuItem> {
         .collect()
 }
 
+fn update_menu_label(status: &update::Status) -> String {
+    match status {
+        update::Status::Idle | update::Status::UpToDate => "Проверить обновления".to_owned(),
+        update::Status::Error(_) => "Повторить проверку обновлений".to_owned(),
+        update::Status::Checking => "Проверка обновлений…".to_owned(),
+        update::Status::Downloading { version, .. } => format!("Скачивание {version}"),
+        update::Status::Verifying { version } => format!("Проверка обновления {version}"),
+        update::Status::Installing { version } => format!("Установка {version}"),
+    }
+}
+
+fn update_menu_detail(status: &update::Status) -> String {
+    match status {
+        update::Status::Idle => format!("Текущая версия {}", crate::APP_VERSION),
+        update::Status::Checking => "Ищем новую версию на GitHub".to_owned(),
+        update::Status::Downloading {
+            received,
+            total: Some(total),
+            ..
+        } if *total > 0 => format!(
+            "{}% · {} из {}",
+            received.saturating_mul(100) / total,
+            format_bytes((*received).min(i64::MAX as u64) as i64),
+            format_bytes((*total).min(i64::MAX as u64) as i64)
+        ),
+        update::Status::Downloading { received, .. } => format!(
+            "Получено {}",
+            format_bytes((*received).min(i64::MAX as u64) as i64)
+        ),
+        update::Status::Verifying { .. } => "Проверяем SHA-256 установщика".to_owned(),
+        update::Status::Installing { .. } => {
+            "Установщик запущен, браузер перезапустится".to_owned()
+        }
+        update::Status::UpToDate => "Установлена последняя версия".to_owned(),
+        update::Status::Error(error) => format!("Ошибка: {error}"),
+    }
+}
+
+fn update_menu_progress(status: &update::Status) -> Option<u64> {
+    match status {
+        update::Status::Downloading {
+            received,
+            total: Some(total),
+            ..
+        } if *total > 0 => Some((received.saturating_mul(100) / total).min(100)),
+        update::Status::Verifying { .. } | update::Status::Installing { .. } => Some(100),
+        _ => None,
+    }
+}
+
 fn main_menu_command_at(y: i32) -> Option<usize> {
     let mut top = 8;
     for (command, separator) in MAIN_MENU_LAYOUT {
         if *separator {
             top += MAIN_MENU_SEPARATOR_HEIGHT;
         }
-        if (top..top + MAIN_MENU_ROW_HEIGHT).contains(&y) {
+        let height = main_menu_row_height(*command);
+        if (top..top + height).contains(&y) {
             return Some(*command);
         }
-        top += MAIN_MENU_ROW_HEIGHT;
+        top += height;
     }
     None
 }
@@ -2630,7 +2744,7 @@ unsafe fn draw_main_menu(ui: &NativeUi, dc: HDC) {
                 left: 6,
                 top,
                 right: client.right - 6,
-                bottom: top + MAIN_MENU_ROW_HEIGHT,
+                bottom: top + main_menu_row_height(item.command),
             };
             if ui.menu_hover == item.command {
                 fill_round_rect(dc, &row, HOVER, 9, None);
@@ -2644,15 +2758,20 @@ unsafe fn draw_main_menu(ui: &NativeUi, dc: HDC) {
                 };
                 draw_icon(dc, &check, Icon::Check, ACCENT);
             }
+            let label_bottom = if item.command == MENU_UPDATE {
+                row.top + 32
+            } else {
+                row.bottom
+            };
             let label = RECT {
                 left: 38,
                 top: row.top,
                 right: client.right - if item.shortcut.is_empty() { 14 } else { 132 },
-                bottom: row.bottom,
+                bottom: label_bottom,
             };
             draw_text(
                 dc,
-                item.label,
+                &item.label,
                 &label,
                 ui.title_font,
                 FOREGROUND,
@@ -2674,7 +2793,42 @@ unsafe fn draw_main_menu(ui: &NativeUi, dc: HDC) {
                     DT_RIGHT | DT_END_ELLIPSIS,
                 );
             }
-            top += MAIN_MENU_ROW_HEIGHT;
+            if item.command == MENU_UPDATE {
+                let detail = RECT {
+                    left: 38,
+                    top: row.top + 29,
+                    right: client.right - 14,
+                    bottom: row.top + 51,
+                };
+                draw_text(
+                    dc,
+                    &update_menu_detail(&ui.update_status),
+                    &detail,
+                    ui.small_font,
+                    if matches!(&ui.update_status, update::Status::Error(_)) {
+                        WARNING
+                    } else {
+                        SECONDARY
+                    },
+                    DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+                if let Some(percent) = update_menu_progress(&ui.update_status) {
+                    let progress = RECT {
+                        left: 38,
+                        top: row.top + 55,
+                        right: client.right - 14,
+                        bottom: row.top + 58,
+                    };
+                    fill_round_rect(dc, &progress, DIVIDER, 2, None);
+                    let mut filled = progress;
+                    filled.right = filled.left
+                        + ((progress.right - progress.left) as u64 * percent / 100) as i32;
+                    if filled.right > filled.left {
+                        fill_round_rect(dc, &filled, ACCENT, 2, None);
+                    }
+                }
+            }
+            top += main_menu_row_height(item.command);
         }
     }
 }
@@ -2689,6 +2843,7 @@ unsafe fn execute_main_menu_command(window: HWND, command: usize) {
             MENU_HISTORY => BrowserController::toggle_history(&controller),
             MENU_BOOKMARKS => BrowserController::toggle_bookmarks_bar(&controller),
             MENU_DOWNLOAD_PROMPT => BrowserController::toggle_download_prompt(&controller),
+            MENU_UPDATE => update::check_now(),
             MENU_CLEAR_HOUR => BrowserController::clear_history(Some(3600)),
             MENU_CLEAR_DAY => BrowserController::clear_history(Some(86_400)),
             MENU_CLEAR_ALL => BrowserController::clear_history(None),
@@ -2997,8 +3152,25 @@ mod tests {
         assert_eq!(main_menu_command_at(85), Some(MENU_BOOKMARKS));
         assert_eq!(
             main_menu_command_at(main_menu_height() - 9),
-            Some(MENU_CLEAR_SITE)
+            Some(MENU_UPDATE)
         );
         assert_eq!(main_menu_command_at(main_menu_height()), None);
+    }
+
+    #[test]
+    fn update_progress_uses_the_actual_download_size() {
+        let downloading = update::Status::Downloading {
+            version: "0.2.3.1".to_owned(),
+            received: 25,
+            total: Some(200),
+        };
+        assert_eq!(update_menu_progress(&downloading), Some(12));
+        assert!(update_menu_detail(&downloading).starts_with("12%"));
+        assert_eq!(
+            update_menu_progress(&update::Status::Installing {
+                version: "0.2.3.1".to_owned()
+            }),
+            Some(100)
+        );
     }
 }

@@ -3,7 +3,9 @@ use std::{
     io::{Read, Write},
     iter, mem,
     path::{Path, PathBuf},
-    ptr, thread,
+    ptr,
+    sync::{Mutex, MutexGuard, OnceLock},
+    thread,
     time::Duration,
 };
 use url::Url;
@@ -18,14 +20,80 @@ const REPOSITORY: &str = "nestjest/kockers-browser";
 const MAX_SUMS_BYTES: usize = 64 * 1024;
 const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const CURRENT_VERSION: &str = crate::APP_VERSION;
+static STATUS: OnceLock<Mutex<Status>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    Idle,
+    Checking,
+    Downloading {
+        version: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    Verifying {
+        version: String,
+    },
+    Installing {
+        version: String,
+    },
+    UpToDate,
+    Error(String),
+}
+
+impl Status {
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Checking
+                | Self::Downloading { .. }
+                | Self::Verifying { .. }
+                | Self::Installing { .. }
+        )
+    }
+}
+
+pub fn snapshot() -> Status {
+    status().clone()
+}
 
 pub fn start() {
     thread::spawn(|| {
         thread::sleep(Duration::from_secs(12));
+        start_check(true);
+    });
+}
+
+pub fn check_now() {
+    start_check(false);
+}
+
+fn start_check(only_if_idle: bool) {
+    {
+        let mut current = status();
+        if current.is_active() || (only_if_idle && *current != Status::Idle) {
+            return;
+        }
+        *current = Status::Checking;
+    }
+    write_status("Проверка обновлений");
+    thread::spawn(|| {
         if let Err(error) = check_for_update() {
+            set_status(Status::Error(error.clone()));
             write_status(&format!("Обновление не установлено: {error}"));
         }
     });
+}
+
+fn status() -> MutexGuard<'static, Status> {
+    STATUS
+        .get_or_init(|| Mutex::new(Status::Idle))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn set_status(value: Status) {
+    *status() = value;
 }
 
 fn check_for_update() -> Result<(), String> {
@@ -35,6 +103,7 @@ fn check_for_update() -> Result<(), String> {
     let version = tag.strip_prefix('v').unwrap_or(&tag);
     let candidate = Version::parse(version)?;
     if candidate <= Version::parse(CURRENT_VERSION)? {
+        set_status(Status::UpToDate);
         write_status(&format!(
             "Актуальная версия {CURRENT_VERSION}; новых обновлений нет"
         ));
@@ -48,13 +117,24 @@ fn check_for_update() -> Result<(), String> {
     let directory = update_directory()?;
     let installer = directory.join(&asset);
     let partial = directory.join(format!("{asset}.download"));
-    download_file(&format!("{base}/{asset}"), &partial, MAX_INSTALLER_BYTES)?;
+    download_file(
+        &format!("{base}/{asset}"),
+        &partial,
+        MAX_INSTALLER_BYTES,
+        version,
+    )?;
+    set_status(Status::Verifying {
+        version: version.to_owned(),
+    });
     let actual = sha256_file(&partial)?;
     if !actual.eq_ignore_ascii_case(expected) {
         let _ = fs::remove_file(&partial);
         return Err("SHA-256 установщика не совпал с релизом".to_owned());
     }
     replace_file(&partial, &installer)?;
+    set_status(Status::Installing {
+        version: version.to_owned(),
+    });
     write_status(&format!("Запуск проверенного обновления {version}"));
     launch_installer(&installer)?;
     Ok(())
@@ -123,18 +203,40 @@ fn download_text(url: &str, limit: usize) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "SHA256SUMS.txt содержит не UTF-8 данные".to_owned())
 }
 
-fn download_file(url: &str, path: &Path, limit: u64) -> Result<(), String> {
+fn download_file(url: &str, path: &Path, limit: u64, version: &str) -> Result<(), String> {
     let response = HttpResponse::open(url)?;
+    let total = response.content_length;
+    if total.is_some_and(|total| total > limit) {
+        return Err("Размер загрузки превышает разрешённый предел".to_owned());
+    }
+    set_status(Status::Downloading {
+        version: version.to_owned(),
+        received: 0,
+        total,
+    });
     let mut file = fs::File::create(path)
         .map_err(|error| format!("Не удалось создать файл обновления: {error}"))?;
+    let mut received = 0u64;
     let result = response.read(limit, |chunk| {
         file.write_all(chunk)
-            .map_err(|error| format!("Не удалось записать обновление: {error}"))
+            .map_err(|error| format!("Не удалось записать обновление: {error}"))?;
+        received += chunk.len() as u64;
+        set_status(Status::Downloading {
+            version: version.to_owned(),
+            received,
+            total,
+        });
+        Ok(())
     });
     if let Err(error) = result {
         drop(file);
         let _ = fs::remove_file(path);
         return Err(error);
+    }
+    if total.is_some_and(|total| total != received) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err("Загрузка оборвалась до получения всего установщика".to_owned());
     }
     file.sync_all()
         .map_err(|error| format!("Не удалось сохранить обновление на диск: {error}"))
@@ -212,6 +314,9 @@ impl Drop for HttpHandle {
 
 struct HttpResponse {
     request: HttpHandle,
+    _connection: HttpHandle,
+    _session: HttpHandle,
+    content_length: Option<u64>,
 }
 
 impl HttpResponse {
@@ -287,7 +392,23 @@ impl HttpResponse {
             if status != 200 {
                 return Err(format!("GitHub вернул HTTP {status}"));
             }
-            Ok(Self { request })
+            let mut content_length = 0u32;
+            let mut content_length_size = mem::size_of::<u32>() as u32;
+            let content_length = (WinHttpQueryHeaders(
+                request.0,
+                WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                ptr::null(),
+                &mut content_length as *mut u32 as *mut core::ffi::c_void,
+                &mut content_length_size,
+                ptr::null_mut(),
+            ) != 0)
+                .then_some(u64::from(content_length));
+            Ok(Self {
+                request,
+                _connection: connection,
+                _session: session,
+                content_length,
+            })
         }
     }
 
@@ -368,7 +489,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
             return Err(format!("BCryptOpenAlgorithmProvider: {status:#x}"));
         }
         let object_length = bcrypt_property(&algorithm, "ObjectLength")? as usize;
-        let hash_length = bcrypt_property(&algorithm, "HashLength")? as usize;
+        let hash_length = bcrypt_property(&algorithm, "HashDigestLength")? as usize;
         if hash_length != 32 || object_length == 0 {
             return Err("Windows CNG вернул неверные параметры SHA-256".to_owned());
         }
@@ -412,19 +533,19 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 
 fn bcrypt_property(algorithm: &AlgorithmHandle, name: &str) -> Result<u32, String> {
     unsafe {
-        let name = wide(name);
+        let property = wide(name);
         let mut value = 0u32;
         let mut written = 0u32;
         let status = BCryptGetProperty(
             algorithm.0,
-            name.as_ptr(),
+            property.as_ptr(),
             &mut value as *mut u32 as *mut u8,
             mem::size_of::<u32>() as u32,
             &mut written,
             0,
         );
         if status < 0 || written != mem::size_of::<u32>() as u32 {
-            Err(format!("BCryptGetProperty: {status:#x}"))
+            Err(format!("BCryptGetProperty({name}): {status:#x}"))
         } else {
             Ok(value)
         }
@@ -571,5 +692,48 @@ mod tests {
         assert!(expected_hash(sums, "KockersBrowser-0.2.0-windows-x64-setup.exe").is_ok());
         assert!(expected_hash(sums, "KockersBrowser-0.3.0-windows-x64-setup.exe").is_err());
         assert!(expected_hash("not-a-hash  file.exe", "file.exe").is_err());
+    }
+
+    #[test]
+    fn hashes_files_with_windows_cng() {
+        let path = PathBuf::from("target").join(format!("sha256-test-{}", std::process::id()));
+        fs::write(&path, []).unwrap();
+        let result = sha256_file(&path);
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            result.as_deref(),
+            Ok("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+    }
+
+    #[test]
+    #[ignore = "downloads the 0.2.3 installer from GitHub"]
+    fn downloads_github_asset_and_reports_progress() {
+        let version = "0.2.3";
+        let asset = format!("KockersBrowser-{version}-windows-x64-setup.exe");
+        let base = format!("https://github.com/{REPOSITORY}/releases/download/v{version}");
+        let path = PathBuf::from("target").join(format!("update-test-{}.exe", std::process::id()));
+        let result = (|| {
+            download_file(
+                &format!("{base}/{asset}"),
+                &path,
+                MAX_INSTALLER_BYTES,
+                version,
+            )?;
+            let Status::Downloading {
+                received, total, ..
+            } = snapshot()
+            else {
+                return Err("После загрузки не сохранился её прогресс".to_owned());
+            };
+            assert_eq!(Some(received), total);
+            assert!(received > 0);
+            let sums = download_text(&format!("{base}/SHA256SUMS.txt"), MAX_SUMS_BYTES)?;
+            let expected = expected_hash(&sums, &asset)?;
+            assert!(sha256_file(&path)?.eq_ignore_ascii_case(expected));
+            Ok(())
+        })();
+        let _ = fs::remove_file(path);
+        result.unwrap();
     }
 }
