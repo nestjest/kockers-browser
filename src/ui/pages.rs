@@ -58,7 +58,7 @@ fn start_page_html() -> String {
     let update_notice = if UPDATED.load(Ordering::Relaxed) {
         format!(
             "<div class=\"update\" role=\"status\"><span>Установлена версия {}</span><a href=\"https://github.com/nestjest/kockers-browser/releases/tag/v{0}\">Что нового</a></div>",
-            env!("CARGO_PKG_VERSION")
+            crate::APP_VERSION
         )
     } else {
         String::new()

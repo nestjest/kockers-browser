@@ -8,7 +8,10 @@ use std::{
     iter, mem,
     path::{Path, PathBuf},
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use windows_sys::Win32::{
@@ -16,7 +19,17 @@ use windows_sys::Win32::{
         COLORREF, ERROR_CLASS_ALREADY_EXISTS, FreeLibrary, GetLastError, HINSTANCE, HWND, LPARAM,
         LRESULT, POINT, RECT, WPARAM,
     },
-    Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*},
+    Graphics::{
+        Dwm::DwmSetWindowAttribute,
+        Gdi::*,
+        GdiPlus::{
+            FillModeAlternate, GdipCreateFromHDC, GdipCreatePen1, GdipCreateSolidFill,
+            GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePen, GdipDrawArc, GdipDrawLines,
+            GdipDrawRectangle, GdipFillPolygon, GdipSetPenEndCap, GdipSetPenLineJoin,
+            GdipSetPenStartCap, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpBrush,
+            GpSolidFill, LineCapRound, LineJoinRound, PointF, SmoothingModeAntiAlias8x8, UnitPixel,
+        },
+    },
     System::{
         LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         Threading::GetCurrentThreadId,
@@ -143,7 +156,6 @@ struct NativeUi {
     font: HFONT,
     small_font: HFONT,
     title_font: HFONT,
-    icon_font: HFONT,
     logo_icon: HICON,
     current_url: String,
     address_editing: bool,
@@ -191,7 +203,6 @@ impl NativeUi {
             font: ptr::null_mut(),
             small_font: ptr::null_mut(),
             title_font: ptr::null_mut(),
-            icon_font: ptr::null_mut(),
             logo_icon: ptr::null_mut(),
             current_url: String::new(),
             address_editing: false,
@@ -226,13 +237,11 @@ impl NativeUi {
             self.font = create_font(15, "Segoe UI");
             self.small_font = create_font(12, "Segoe UI");
             self.title_font = create_font(13, "Segoe UI");
-            self.icon_font = create_icon_font();
             if self.background_brush.is_null()
                 || self.surface_brush.is_null()
                 || self.font.is_null()
                 || self.small_font.is_null()
                 || self.title_font.is_null()
-                || self.icon_font.is_null()
             {
                 return Err("Не удалось создать графические ресурсы панели.".to_owned());
             }
@@ -713,7 +722,6 @@ impl NativeUi {
                 self.font as HGDIOBJ,
                 self.small_font as HGDIOBJ,
                 self.title_font as HGDIOBJ,
-                self.icon_font as HGDIOBJ,
             ] {
                 if !object.is_null() {
                     DeleteObject(object);
@@ -1831,7 +1839,7 @@ unsafe fn draw_bookmarks(ui: &NativeUi, dc: HDC) {
                 right: rect.left + 28,
                 bottom: rect.bottom,
             };
-            draw_icon(dc, ui.icon_font, &icon, Icon::Bookmark, SECONDARY);
+            draw_icon(dc, &icon, Icon::Bookmark, SECONDARY);
             let title = RECT {
                 left: rect.left + 29,
                 top: rect.top,
@@ -1920,7 +1928,7 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
                 None,
             );
         }
-        draw_icon(dc, ui.icon_font, &close, Icon::Close, SECONDARY);
+        draw_icon(dc, &close, Icon::Close, SECONDARY);
     }
 }
 
@@ -1955,7 +1963,6 @@ unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, 
         }
         draw_icon(
             dc,
-            ui.icon_font,
             &rect,
             icon,
             if enabled {
@@ -1983,7 +1990,6 @@ unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
         }
         draw_icon(
             dc,
-            ui.icon_font,
             &rect,
             Icon::Close,
             if hovered { SURFACE } else { FOREGROUND },
@@ -1991,37 +1997,163 @@ unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
     }
 }
 
-unsafe fn draw_icon(dc: HDC, font: HFONT, target: &RECT, icon: Icon, color: COLORREF) {
-    let glyph = match icon {
-        Icon::Back => '\u{E72B}',
-        Icon::Forward => '\u{E72A}',
-        Icon::Reload => '\u{E72C}',
-        Icon::Home => '\u{E80F}',
-        Icon::NewTab => '\u{E710}',
-        Icon::Download => '\u{E896}',
-        Icon::Menu => '\u{E712}',
-        Icon::Minimize => '\u{E921}',
-        Icon::Maximize => '\u{E922}',
-        Icon::Restore => '\u{E923}',
-        Icon::Pause => '\u{E769}',
-        Icon::Play => '\u{E768}',
-        Icon::Close => '\u{E711}',
-        Icon::Bookmark => '\u{E734}',
-        Icon::BookmarkFilled => '\u{E735}',
-    };
-    let mut glyph = wide(&glyph.to_string());
-    let mut rect = *target;
+static GDI_PLUS: OnceLock<usize> = OnceLock::new();
+
+unsafe fn draw_icon(dc: HDC, target: &RECT, icon: Icon, color: COLORREF) {
+    const SIZE: f32 = 18.0;
+    const STROKE: f32 = 1.8;
+    let scale = SIZE / 24.0;
+    let left = (target.left + target.right) as f32 / 2.0 - SIZE / 2.0;
+    let top = (target.top + target.bottom) as f32 / 2.0 - SIZE / 2.0;
+    let token = *GDI_PLUS.get_or_init(|| {
+        let input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        let mut token = 0;
+        unsafe { GdiplusStartup(&mut token, &input, ptr::null_mut()) };
+        token
+    });
+    if token == 0 {
+        return;
+    }
     unsafe {
-        SelectObject(dc, font as HGDIOBJ);
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, color);
-        DrawTextW(
-            dc,
-            glyph.as_mut_ptr(),
-            glyph.len() as i32 - 1,
-            &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
+        let mut graphics = ptr::null_mut();
+        if GdipCreateFromHDC(dc, &mut graphics) != 0 {
+            return;
+        }
+        GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias8x8);
+        let argb = 0xFF00_0000
+            | (color & 0xFF)
+            | ((color >> 8) & 0xFF) << 8
+            | ((color >> 16) & 0xFF) << 16;
+        let mut pen = ptr::null_mut();
+        if GdipCreatePen1(argb, STROKE * scale, UnitPixel, &mut pen) != 0 {
+            GdipDeleteGraphics(graphics);
+            return;
+        }
+        GdipSetPenStartCap(pen, LineCapRound);
+        GdipSetPenEndCap(pen, LineCapRound);
+        GdipSetPenLineJoin(pen, LineJoinRound);
+        let lines: &[&[(f32, f32)]] = match icon {
+            Icon::Back => &[
+                &[(19.0, 12.0), (5.0, 12.0)],
+                &[(12.0, 19.0), (5.0, 12.0), (12.0, 5.0)],
+            ],
+            Icon::Forward => &[
+                &[(5.0, 12.0), (19.0, 12.0)],
+                &[(12.0, 5.0), (19.0, 12.0), (12.0, 19.0)],
+            ],
+            Icon::Reload => &[&[(21.0, 3.0), (21.0, 8.0), (16.0, 8.0)]],
+            Icon::Home => &[
+                &[(3.0, 11.0), (12.0, 3.0), (21.0, 11.0)],
+                &[(5.0, 10.0), (5.0, 20.0), (19.0, 20.0), (19.0, 10.0)],
+                &[(9.0, 20.0), (9.0, 14.0), (15.0, 14.0), (15.0, 20.0)],
+            ],
+            Icon::NewTab => &[&[(12.0, 5.0), (12.0, 19.0)], &[(5.0, 12.0), (19.0, 12.0)]],
+            Icon::Download => &[
+                &[(12.0, 3.0), (12.0, 15.0)],
+                &[(7.0, 10.0), (12.0, 15.0), (17.0, 10.0)],
+                &[(5.0, 17.0), (5.0, 20.0), (19.0, 20.0), (19.0, 17.0)],
+            ],
+            Icon::Menu => &[
+                &[(12.0, 5.0), (12.0, 5.01)],
+                &[(12.0, 12.0), (12.0, 12.01)],
+                &[(12.0, 19.0), (12.0, 19.01)],
+            ],
+            Icon::Minimize => &[&[(5.0, 12.0), (19.0, 12.0)]],
+            Icon::Restore => &[
+                &[
+                    (8.0, 8.0),
+                    (8.0, 5.0),
+                    (19.0, 5.0),
+                    (19.0, 16.0),
+                    (16.0, 16.0),
+                ],
+                &[
+                    (5.0, 8.0),
+                    (16.0, 8.0),
+                    (16.0, 19.0),
+                    (5.0, 19.0),
+                    (5.0, 8.0),
+                ],
+            ],
+            Icon::Pause => &[&[(9.0, 5.0), (9.0, 19.0)], &[(15.0, 5.0), (15.0, 19.0)]],
+            Icon::Play => &[&[(8.0, 5.0), (19.0, 12.0), (8.0, 19.0), (8.0, 5.0)]],
+            Icon::Close => &[&[(6.0, 6.0), (18.0, 18.0)], &[(18.0, 6.0), (6.0, 18.0)]],
+            Icon::Bookmark | Icon::BookmarkFilled => &[&[
+                (12.0, 3.0),
+                (14.6, 8.3),
+                (20.5, 9.2),
+                (16.2, 13.4),
+                (17.2, 19.3),
+                (12.0, 16.5),
+                (6.8, 19.3),
+                (7.8, 13.4),
+                (3.5, 9.2),
+                (9.4, 8.3),
+                (12.0, 3.0),
+            ]],
+            Icon::Maximize => &[],
+        };
+        for line in lines {
+            let points = line
+                .iter()
+                .map(|&(x, y)| PointF {
+                    X: left + x * scale,
+                    Y: top + y * scale,
+                })
+                .collect::<Vec<_>>();
+            GdipDrawLines(graphics, pen, points.as_ptr(), points.len() as i32);
+        }
+        match icon {
+            Icon::Reload => {
+                GdipDrawArc(
+                    graphics,
+                    pen,
+                    left + 5.0 * scale,
+                    top + 5.0 * scale,
+                    14.0 * scale,
+                    14.0 * scale,
+                    -35.0,
+                    300.0,
+                );
+            }
+            Icon::Maximize => {
+                GdipDrawRectangle(
+                    graphics,
+                    pen,
+                    left + 5.0 * scale,
+                    top + 5.0 * scale,
+                    14.0 * scale,
+                    14.0 * scale,
+                );
+            }
+            Icon::BookmarkFilled => {
+                let mut solid_brush: *mut GpSolidFill = ptr::null_mut();
+                if GdipCreateSolidFill(argb, &mut solid_brush) == 0 {
+                    let brush = solid_brush as *mut GpBrush;
+                    let points = lines[0]
+                        .iter()
+                        .map(|&(x, y)| PointF {
+                            X: left + x * scale,
+                            Y: top + y * scale,
+                        })
+                        .collect::<Vec<_>>();
+                    GdipFillPolygon(
+                        graphics,
+                        brush,
+                        points.as_ptr(),
+                        points.len() as i32,
+                        FillModeAlternate,
+                    );
+                    GdipDeleteBrush(brush);
+                }
+            }
+            _ => {}
+        }
+        GdipDeletePen(pen);
+        GdipDeleteGraphics(graphics);
     }
 }
 
@@ -2052,7 +2184,7 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
             right: client.right - 10,
             bottom: 44,
         };
-        draw_icon(dc, ui.icon_font, &close, Icon::Close, SECONDARY);
+        draw_icon(dc, &close, Icon::Close, SECONDARY);
         if ui.downloads.is_empty() {
             let empty = RECT {
                 left: 20,
@@ -2119,7 +2251,6 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
                 }
                 DownloadStatus::InProgress | DownloadStatus::Paused => draw_icon(
                     dc,
-                    ui.icon_font,
                     &action,
                     if download.status == DownloadStatus::Paused {
                         Icon::Play
@@ -2140,7 +2271,7 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
                     right: client.right - 14,
                     bottom: top + 52,
                 };
-                draw_icon(dc, ui.icon_font, &cancel, Icon::Close, SECONDARY);
+                draw_icon(dc, &cancel, Icon::Close, SECONDARY);
             }
             if matches!(
                 download.status,
@@ -2478,27 +2609,6 @@ unsafe fn create_font(height: i32, family: &str) -> HFONT {
             CLEARTYPE_QUALITY.into(),
             (DEFAULT_PITCH | FF_DONTCARE).into(),
             wide(family).as_ptr(),
-        )
-    }
-}
-
-unsafe fn create_icon_font() -> HFONT {
-    unsafe {
-        CreateFontW(
-            -20,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.into(),
-            OUT_DEFAULT_PRECIS.into(),
-            CLIP_DEFAULT_PRECIS.into(),
-            ANTIALIASED_QUALITY.into(),
-            (DEFAULT_PITCH | FF_DONTCARE).into(),
-            wide("Segoe MDL2 Assets").as_ptr(),
         )
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "kockers_browser"
-version = "0.2.2-alpha"
+version = "0.2.2-alpha.1"
 edition = "2024"
 publish = false
 build = "build.rs"
@@ -26,6 +26,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
     "Win32_Networking_WinHttp",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",

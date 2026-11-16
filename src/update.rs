@@ -17,7 +17,7 @@ use windows_sys::Win32::{
 const REPOSITORY: &str = "nestjest/kockers-browser";
 const MAX_SUMS_BYTES: usize = 64 * 1024;
 const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CURRENT_VERSION: &str = crate::APP_VERSION;
 
 pub fn start() {
     thread::spawn(|| {
@@ -436,6 +436,7 @@ struct Version {
     major: u64,
     minor: u64,
     patch: u64,
+    revision: u64,
     prerelease: Option<String>,
 }
 
@@ -446,13 +447,13 @@ impl Version {
             .map(|(numeric, prerelease)| (numeric, Some(prerelease)))
             .unwrap_or((value, None));
         let numbers = numeric.split('.').collect::<Vec<_>>();
-        if numbers.len() != 3
+        if !matches!(numbers.len(), 3 | 4)
             || numbers
                 .iter()
                 .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
             || prerelease.is_some_and(|part| part.is_empty())
         {
-            return Err(format!("Некорректная semver-версия: {value}"));
+            return Err(format!("Некорректная версия: {value}"));
         }
         Ok(Self {
             major: numbers[0]
@@ -464,6 +465,12 @@ impl Version {
             patch: numbers[2]
                 .parse()
                 .map_err(|_| "Слишком большая patch-версия")?,
+            revision: numbers
+                .get(3)
+                .map(|part| part.parse())
+                .transpose()
+                .map_err(|_| "Слишком большая hotfix-версия")?
+                .unwrap_or(0),
             prerelease: prerelease.map(str::to_owned),
         })
     }
@@ -483,8 +490,8 @@ impl Ord for Version {
 
 impl Version {
     fn cmp_numeric(&self, other: &Self) -> std::cmp::Ordering {
-        (self.major, self.minor, self.patch)
-            .cmp(&(other.major, other.minor, other.patch))
+        (self.major, self.minor, self.patch, self.revision)
+            .cmp(&(other.major, other.minor, other.patch, other.revision))
             .then_with(|| match (&self.prerelease, &other.prerelease) {
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -539,6 +546,8 @@ mod tests {
             Version::parse("0.2.0-alpha.10").unwrap() > Version::parse("0.2.0-alpha.2").unwrap()
         );
         assert!(Version::parse("0.1.0").unwrap() > Version::parse("0.1.0-rc.1").unwrap());
+        assert!(Version::parse("0.2.2.1").unwrap() > Version::parse("0.2.2-alpha").unwrap());
+        assert!(Version::parse("0.2.2.2").unwrap() > Version::parse("0.2.2.1").unwrap());
     }
 
     #[test]
@@ -546,6 +555,7 @@ mod tests {
         assert!(Version::parse("1.0").is_err());
         assert!(Version::parse("1.0.0-").is_err());
         assert!(Version::parse("1.0.x").is_err());
+        assert!(Version::parse("1.0.0.0.0").is_err());
     }
 
     #[test]
