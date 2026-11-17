@@ -33,6 +33,28 @@ pub fn run(main_args: &MainArgs, command_line: &CommandLine, sandbox_info: *mut 
         return 1;
     };
 
+    let preferences = crate::storage::load_preferences();
+    for (enabled, name) in [
+        (preferences.hardware_acceleration, "disable-gpu"),
+        (preferences.smooth_scrolling, "disable-smooth-scrolling"),
+        (
+            preferences.background_throttling,
+            "disable-background-timer-throttling",
+        ),
+        (
+            preferences.background_throttling,
+            "disable-backgrounding-occluded-windows",
+        ),
+        (
+            preferences.background_throttling,
+            "disable-renderer-backgrounding",
+        ),
+    ] {
+        if !enabled {
+            command_line.append_switch(Some(&CefString::from(name)));
+        }
+    }
+
     let controller = Arc::new(Mutex::new(browser::BrowserController::default()));
     let mut app = KockersApp::new(controller);
     let settings = Settings {
@@ -95,8 +117,18 @@ wrap_browser_process_handler! {
             _current_directory: Option<&CefString>,
         ) -> i32 {
             let window = browser::lock_controller(&self.controller).window();
-            if !window.is_null() {
+            if unsafe { platform::window_is_valid(window) } {
                 unsafe { platform::focus_address(window) };
+                return 1;
+            }
+            let client = self.client.borrow().as_ref().cloned();
+            let Some(client) = client else {
+                return 0;
+            };
+            *browser::lock_controller(&self.controller) = browser::BrowserController::default();
+            match platform::create_main_window(self.controller.clone()) {
+                Ok(window) => browser::create_main_browser(window, self.controller.clone(), client),
+                Err(error) => platform::show_fatal_error(&error),
             }
             1
         }

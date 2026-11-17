@@ -1,4 +1,7 @@
-use crate::{navigation, platform, storage, ui::pages};
+use crate::{
+    navigation, platform, storage,
+    ui::{self, pages},
+};
 use cef::*;
 use std::{
     collections::VecDeque,
@@ -8,12 +11,12 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::HWND,
-    UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
+    UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F11, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
 };
 
 pub type SharedController = Arc<Mutex<BrowserController>>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TabSnapshot {
     pub id: u64,
     pub title: String,
@@ -53,6 +56,8 @@ struct Tab {
     is_loading: bool,
     can_go_back: bool,
     can_go_forward: bool,
+    zoom_percent: i32,
+    ready: bool,
 }
 
 struct ClosedTab {
@@ -155,7 +160,7 @@ impl BrowserController {
     }
 
     pub fn preferences(&self) -> storage::Preferences {
-        self.preferences
+        self.preferences.clone()
     }
 
     pub fn bookmarks_snapshot(&self) -> Vec<storage::Bookmark> {
@@ -195,9 +200,10 @@ impl BrowserController {
     }
 
     pub fn navigate_input(controller: &SharedController, input: &str) {
-        let target = match navigation::normalize_input(input) {
+        let engine = lock_controller(controller).preferences.search_engine;
+        let target = match navigation::normalize_input_with(input, engine) {
             Ok(Some(url)) => url,
-            Ok(None) => pages::start_page_url().to_owned(),
+            Ok(None) => pages::start_page_url(),
             Err(error) => pages::error_page_url(input, &error.to_string(), None),
         };
         Self::load_url(controller, &target);
@@ -262,6 +268,8 @@ impl BrowserController {
                     is_loading: false,
                     can_go_back: false,
                     can_go_forward: false,
+                    zoom_percent: 100,
+                    ready: false,
                 },
             );
             if !background {
@@ -384,7 +392,7 @@ impl BrowserController {
         };
         if empty {
             if !closing_window {
-                Self::new_tab(controller, pages::start_page_url(), false);
+                Self::new_tab(controller, &pages::start_page_url(), false);
             }
         } else {
             let active = if was_active && !closing_window {
@@ -445,6 +453,40 @@ impl BrowserController {
         self.active_tab()
             .map(|tab| (tab.can_go_back, tab.can_go_forward))
             .unwrap_or((false, false))
+    }
+
+    pub fn active_zoom_percent(&self) -> i32 {
+        self.active_tab().map_or(100, |tab| tab.zoom_percent)
+    }
+
+    pub fn change_zoom(controller: &SharedController, direction: i32) {
+        let (host, percent) = {
+            let mut state = lock_controller(controller);
+            let Some(tab) = state.active.and_then(|id| state.tab_mut(id)) else {
+                return;
+            };
+            let steps = [
+                50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500,
+            ];
+            let current = steps
+                .iter()
+                .position(|step| *step == tab.zoom_percent)
+                .unwrap_or(5) as i32;
+            if direction != 0 {
+                let next = (current + direction).clamp(0, steps.len() as i32 - 1);
+                tab.zoom_percent = steps[next as usize];
+            } else {
+                tab.zoom_percent = 100;
+            }
+            (
+                tab.browser.as_ref().and_then(Browser::host),
+                tab.zoom_percent,
+            )
+        };
+        if let Some(host) = host {
+            let level = (percent as f64 / 100.0).ln() / 1.2_f64.ln();
+            host.set_zoom_level(level);
+        }
     }
 
     pub fn go_back(controller: &SharedController) {
@@ -510,7 +552,7 @@ impl BrowserController {
     }
 
     pub fn go_home(controller: &SharedController) {
-        Self::load_url(controller, pages::start_page_url());
+        Self::load_url(controller, &pages::start_page_url());
     }
 
     pub fn show_dev_tools(controller: &SharedController) {
@@ -564,27 +606,27 @@ impl BrowserController {
         let preferences = {
             let mut state = lock_controller(controller);
             state.preferences.save_history = !state.preferences.save_history;
-            state.preferences
+            state.preferences.clone()
         };
-        storage::save_preferences(preferences);
+        storage::save_preferences(&preferences);
     }
 
     pub fn toggle_download_prompt(controller: &SharedController) {
         let preferences = {
             let mut state = lock_controller(controller);
             state.preferences.ask_download_path = !state.preferences.ask_download_path;
-            state.preferences
+            state.preferences.clone()
         };
-        storage::save_preferences(preferences);
+        storage::save_preferences(&preferences);
     }
 
     pub fn toggle_bookmarks_bar(controller: &SharedController) {
         let (window, preferences) = {
             let mut state = lock_controller(controller);
             state.preferences.show_bookmarks = !state.preferences.show_bookmarks;
-            (state.window, state.preferences)
+            (state.window, state.preferences.clone())
         };
-        storage::save_preferences(preferences);
+        storage::save_preferences(&preferences);
         platform::refresh_bookmarks(window);
     }
 
@@ -656,6 +698,235 @@ impl BrowserController {
                 cookies.delete_cookies(None, None, None);
             }
         }
+    }
+
+    pub fn open_internal_page(controller: &SharedController, page: ui::internal::InternalPage) {
+        Self::load_url(controller, &page.url());
+    }
+
+    pub fn handle_internal_action(controller: &SharedController, action: &str) {
+        let Ok(url) = url::Url::parse(action) else {
+            return;
+        };
+        let parameters = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        let parameter = |name: &str| {
+            parameters
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        let path = url.path();
+        let page = match path {
+            "open/profile" => Some(ui::internal::InternalPage::Profile),
+            "open/history" => Some(ui::internal::InternalPage::History),
+            "open/settings/sync" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Sync,
+            )),
+            "open/settings/performance" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Performance,
+            )),
+            "open/settings/appearance" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Appearance,
+            )),
+            "open/settings/search" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Search,
+            )),
+            "open/settings/default" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::DefaultBrowser,
+            )),
+            "open/settings/startup" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Startup,
+            )),
+            "open/settings/languages" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Languages,
+            )),
+            "open/settings/downloads" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Downloads,
+            )),
+            "open/settings/system" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::System,
+            )),
+            "open/settings/reset" => Some(ui::internal::InternalPage::Settings(
+                ui::internal::Section::Reset,
+            )),
+            _ => None,
+        };
+        if let Some(page) = page {
+            Self::open_internal_page(controller, page);
+            return;
+        }
+        match path {
+            "settings/set" => {
+                let mut preferences = lock_controller(controller).preferences();
+                let key = parameter("key");
+                let value = parameter("value");
+                let enabled = value == "true";
+                match key.as_str() {
+                    "reduce_animations" => preferences.reduce_animations = enabled,
+                    "smooth_scrolling" => preferences.smooth_scrolling = enabled,
+                    "background_throttling" => preferences.background_throttling = enabled,
+                    "lazy_restore" => preferences.lazy_restore = enabled,
+                    "continue_background" => preferences.continue_background = enabled,
+                    "hardware_acceleration" => preferences.hardware_acceleration = enabled,
+                    "show_tips" => preferences.show_tips = enabled,
+                    "bookmarks" => preferences.show_bookmarks = enabled,
+                    "ask_download" => preferences.ask_download_path = enabled,
+                    "theme" => {
+                        preferences.theme = match value.as_str() {
+                            "dark" => storage::Theme::Dark,
+                            _ => storage::Theme::Light,
+                        };
+                    }
+                    "accent" => {
+                        preferences.accent = match value.as_str() {
+                            "blue" => storage::Accent::Blue,
+                            "graphite" => storage::Accent::Graphite,
+                            _ => storage::Accent::Olive,
+                        };
+                    }
+                    "language" => {
+                        preferences.language = match value.as_str() {
+                            "en" => storage::Language::English,
+                            _ => storage::Language::Russian,
+                        };
+                    }
+                    "search" => {
+                        preferences.search_engine = match value.as_str() {
+                            "bing" => storage::SearchEngine::Bing,
+                            "duckduckgo" => storage::SearchEngine::DuckDuckGo,
+                            "yandex" => storage::SearchEngine::Yandex,
+                            _ => storage::SearchEngine::Google,
+                        };
+                    }
+                    "startup" => {
+                        preferences.startup_mode = match value.as_str() {
+                            "new_tab" => storage::StartupMode::NewTab,
+                            "custom" => storage::StartupMode::Custom,
+                            _ => storage::StartupMode::Restore,
+                        };
+                    }
+                    "startup_url" => preferences.startup_url = value,
+                    _ => return,
+                }
+                let section = match key.as_str() {
+                    "reduce_animations"
+                    | "smooth_scrolling"
+                    | "background_throttling"
+                    | "lazy_restore" => ui::internal::Section::Performance,
+                    "theme" | "accent" | "bookmarks" => ui::internal::Section::Appearance,
+                    "language" => ui::internal::Section::Languages,
+                    "search" => ui::internal::Section::Search,
+                    "startup" | "startup_url" => ui::internal::Section::Startup,
+                    "ask_download" => ui::internal::Section::Downloads,
+                    _ => ui::internal::Section::System,
+                };
+                Self::apply_preferences(
+                    controller,
+                    preferences,
+                    ui::internal::InternalPage::Settings(section),
+                );
+            }
+            "profile/save" => {
+                let mut profile = storage::load_profile();
+                profile.nickname = parameter("nickname").chars().take(60).collect();
+                profile.description = parameter("description").chars().take(500).collect();
+                storage::save_profile(&profile);
+                Self::open_internal_page(controller, ui::internal::InternalPage::Profile);
+            }
+            "profile/avatar" | "profile/banner" => {
+                let window = lock_controller(controller).window();
+                let banner = path == "profile/banner";
+                if let Some(source) = platform::choose_image(window) {
+                    match storage::store_profile_image(&source, banner) {
+                        Ok(stored) => {
+                            let mut profile = storage::load_profile();
+                            if banner {
+                                profile.banner_path = stored;
+                            } else {
+                                profile.avatar_path = stored;
+                            }
+                            storage::save_profile(&profile);
+                            Self::open_internal_page(
+                                controller,
+                                ui::internal::InternalPage::Profile,
+                            );
+                        }
+                        Err(error) => platform::show_fatal_error(&error),
+                    }
+                }
+            }
+            "config/export" => {
+                let window = lock_controller(controller).window();
+                if let Err(error) = platform::export_config(window, &storage::export_config()) {
+                    platform::show_fatal_error(&error);
+                }
+            }
+            "config/import" => {
+                let window = lock_controller(controller).window();
+                if let Some(text) = platform::import_config(window) {
+                    match storage::import_config(&text) {
+                        Ok((preferences, profile)) => {
+                            storage::save_profile(&profile);
+                            Self::apply_preferences(
+                                controller,
+                                preferences,
+                                ui::internal::InternalPage::Settings(ui::internal::Section::Sync),
+                            );
+                        }
+                        Err(error) => platform::show_fatal_error(&error),
+                    }
+                }
+            }
+            "downloads/choose" => {
+                let window = lock_controller(controller).window();
+                if let Some(directory) = platform::choose_download_folder(window) {
+                    let mut preferences = lock_controller(controller).preferences();
+                    preferences.download_dir = directory.to_string_lossy().into_owned();
+                    Self::apply_preferences(
+                        controller,
+                        preferences,
+                        ui::internal::InternalPage::Settings(ui::internal::Section::Downloads),
+                    );
+                }
+            }
+            "system/proxy" => platform::open_proxy_settings(),
+            "system/default-browser" => platform::open_default_browser_settings(),
+            "settings/reset" => {
+                Self::apply_preferences(
+                    controller,
+                    storage::Preferences::default(),
+                    ui::internal::InternalPage::Settings(ui::internal::Section::Reset),
+                );
+            }
+            "history/remove" => {
+                storage::remove_history(&parameter("url"));
+                Self::open_internal_page(controller, ui::internal::InternalPage::History);
+            }
+            "history/clear" => {
+                storage::clear_history_since(None);
+                Self::open_internal_page(controller, ui::internal::InternalPage::History);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_preferences(
+        controller: &SharedController,
+        preferences: storage::Preferences,
+        page: ui::internal::InternalPage,
+    ) {
+        let window = {
+            let mut state = lock_controller(controller);
+            state.preferences = preferences.clone();
+            state.window
+        };
+        storage::save_preferences(&preferences);
+        platform::preferences_changed(window);
+        Self::open_internal_page(controller, page);
     }
 
     pub fn cancel_download(controller: &SharedController, id: u32) {
@@ -800,6 +1071,7 @@ impl BrowserController {
     fn browser_handles(&self) -> Vec<(u64, HWND)> {
         self.tabs
             .iter()
+            .filter(|tab| tab.ready)
             .filter_map(|tab| {
                 tab.browser
                     .as_ref()
@@ -849,9 +1121,9 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
             return;
         }
     }
-    let (url, context) = {
+    let (url, context, lazy_restore) = {
         let mut state = lock_controller(&controller);
-        if !state.private {
+        if !state.private && state.preferences.startup_mode == storage::StartupMode::Restore {
             let session = storage::load_session();
             if !session.tabs.is_empty() {
                 for tab in session.tabs {
@@ -867,34 +1139,72 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
                         is_loading: false,
                         can_go_back: false,
                         can_go_forward: false,
+                        zoom_percent: 100,
+                        ready: false,
                     });
                 }
                 state.active = state.tabs.get(session.active).map(|tab| tab.id);
             }
         }
         if state.tabs.is_empty() {
+            let initial_url = if state.preferences.startup_mode == storage::StartupMode::Custom {
+                navigation::normalize_input_with(
+                    &state.preferences.startup_url,
+                    state.preferences.search_engine,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or_else(pages::start_page_url)
+            } else {
+                pages::start_page_url()
+            };
             let id = state.next_tab_id;
             state.next_tab_id += 1;
             state.tabs.push(Tab {
                 id,
                 browser: None,
                 title: "Новая вкладка".to_owned(),
-                url: pages::start_page_url().to_owned(),
+                url: initial_url,
                 pinned: false,
                 closing: false,
                 is_loading: false,
                 can_go_back: false,
                 can_go_forward: false,
+                zoom_percent: 100,
+                ready: false,
             });
             state.active = Some(id);
         }
         let active = state.active.expect("initial tab");
         state.pending.push_back(active);
         let tab = state.tab(active).expect("initial tab");
-        (tab.url.clone(), state.request_context.clone())
+        (
+            tab.url.clone(),
+            state.request_context.clone(),
+            state.preferences.lazy_restore,
+        )
     };
     platform::refresh_tabs(window);
-    create_browser_with_client(window, &url, context, &mut client);
+    create_browser_with_client(window, &url, context.clone(), &mut client);
+    if !lazy_restore {
+        let restored = {
+            let mut state = lock_controller(&controller);
+            let active = state.active;
+            let tabs = state
+                .tabs
+                .iter()
+                .filter(|tab| Some(tab.id) != active)
+                .map(|tab| (tab.id, tab.url.clone()))
+                .collect::<Vec<_>>();
+            for (id, _) in &tabs {
+                state.pending.push_back(*id);
+            }
+            tabs
+        };
+        for (_, url) in restored {
+            create_browser(window, controller.clone(), &url, context.clone());
+        }
+    }
 }
 
 fn create_browser(
@@ -927,7 +1237,11 @@ fn create_browser_with_client(
     }
     .set_as_child(sys::HWND(window.cast()), &bounds);
     let settings = BrowserSettings {
-        background_color: 0xFFF7F7F4,
+        background_color: if storage::load_preferences().theme == storage::Theme::Dark {
+            0xFF171917
+        } else {
+            0xFFF7F7F4
+        },
         ..Default::default()
     };
     let created = browser_host_create_browser(
@@ -1158,9 +1472,15 @@ wrap_life_span_handler! {
 
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let handle = browser
+                .as_ref()
+                .and_then(|browser| browser.host())
+                .map(|host| host.window_handle().0.cast::<std::ffi::c_void>());
             let window = lock_controller(&self.controller).on_after_created(browser);
             if let Some(window) = window {
-                apply_visibility(&self.controller, window);
+                if let Some(handle) = handle.filter(|handle| !handle.is_null()) {
+                    platform::apply_browser_visibility(window, &[(0, handle)], None);
+                }
                 platform::refresh_tabs(window);
                 platform::sync_active_tab(window);
             }
@@ -1199,7 +1519,14 @@ wrap_life_span_handler! {
         ) -> i32 {
             if user_gesture != 0 {
                 let url = target_url.map(CefString::to_string).unwrap_or_default();
-                if url.starts_with("https://") || url.starts_with("http://") {
+                if ui::internal::is_action_url(&url) {
+                    let internal = lock_controller(&self.controller)
+                        .active_tab()
+                        .is_some_and(|tab| tab.url.starts_with("data:"));
+                    if internal {
+                        BrowserController::handle_internal_action(&self.controller, &url);
+                    }
+                } else if url.starts_with("https://") || url.starts_with("http://") {
                     BrowserController::new_tab(&self.controller, &url, false);
                 }
             }
@@ -1247,6 +1574,35 @@ wrap_load_handler! {
                         platform::update_loading_state(window, loading, back, forward);
                     }
                     platform::refresh_tabs(window);
+                }
+            }
+        }
+
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: i32,
+        ) {
+            if frame.is_none_or(|frame| frame.is_main() == 0) {
+                return;
+            }
+            if let Some(id) = browser_id(browser) {
+                let window = {
+                    let mut state = lock_controller(&self.controller);
+                    let window = state.window;
+                    let tab = state.tabs.iter_mut().find(|tab| {
+                        tab.browser
+                            .as_ref()
+                            .is_some_and(|browser| browser.identifier() == id)
+                    });
+                    tab.map(|tab| {
+                        tab.ready = true;
+                        window
+                    })
+                };
+                if let Some(window) = window {
+                    apply_visibility(&self.controller, window);
                 }
             }
         }
@@ -1312,11 +1668,15 @@ wrap_download_handler! {
             let (Some(item), Some(callback)) = (download_item, callback) else { return 0 };
             let suggested = suggested_name.map(CefString::to_string).unwrap_or_default();
             let name = sanitize_download_name(&suggested);
-            let (window, ask) = {
+            let (window, ask, directory) = {
                 let state = lock_controller(&self.controller);
-                (state.window, state.preferences.ask_download_path)
+                (
+                    state.window,
+                    state.preferences.ask_download_path,
+                    state.preferences.download_dir.clone(),
+                )
             };
-            if let Some(path) = platform::choose_download_path(window, &name, ask) {
+            if let Some(path) = platform::choose_download_path(window, &name, ask, &directory) {
                 let path = CefString::from(path.to_string_lossy().as_ref());
                 callback.cont(Some(&path), 0);
                 update_download(&self.controller, item, None);
@@ -1355,6 +1715,15 @@ wrap_request_handler! {
                 return 0;
             }
             let url = request.map(|request| CefString::from(&request.url()).to_string()).unwrap_or_default();
+            if ui::internal::is_action_url(&url) {
+                let internal = lock_controller(&self.controller)
+                    .active_tab()
+                    .is_some_and(|tab| tab.url.starts_with("data:"));
+                if internal {
+                    BrowserController::handle_internal_action(&self.controller, &url);
+                }
+                return 1;
+            }
             let allowed = ["http://", "https://", "data:", "about:", "blob:"]
                 .iter()
                 .any(|scheme| url.starts_with(scheme));
@@ -1369,6 +1738,16 @@ wrap_request_handler! {
             target_disposition: WindowOpenDisposition,
             user_gesture: i32,
         ) -> i32 {
+            let url = target_url.map(CefString::to_string).unwrap_or_default();
+            if ui::internal::is_action_url(&url) {
+                let internal = lock_controller(&self.controller)
+                    .active_tab()
+                    .is_some_and(|tab| tab.url.starts_with("data:"));
+                if internal {
+                    BrowserController::handle_internal_action(&self.controller, &url);
+                }
+                return 1;
+            }
             if matches!(target_disposition, WindowOpenDisposition::NEW_FOREGROUND_TAB | WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_POPUP | WindowOpenDisposition::NEW_WINDOW) {
                 if user_gesture != 0 {
                     let url = target_url.map(CefString::to_string).unwrap_or_default();
@@ -1448,9 +1827,10 @@ wrap_keyboard_handler! {
                 key if key == 'L' as i32 && control => unsafe { platform::focus_address(window) },
                 key if key == 'R' as i32 && control => BrowserController::reload(&self.controller),
                 key if key == 'D' as i32 && control => BrowserController::toggle_bookmark(&self.controller),
+                key if key == 'H' as i32 && control => BrowserController::open_internal_page(&self.controller, ui::internal::InternalPage::History),
                 key if key == 'B' as i32 && control && shift => BrowserController::toggle_bookmarks_bar(&self.controller),
                 key if key == 'T' as i32 && control && shift => BrowserController::restore_closed_tab(&self.controller),
-                key if key == 'T' as i32 && control => BrowserController::new_tab(&self.controller, pages::start_page_url(), false),
+                key if key == 'T' as i32 && control => BrowserController::new_tab(&self.controller, &pages::start_page_url(), false),
                 key if key == 'W' as i32 && control => BrowserController::close_active_tab(&self.controller),
                 key if key == 'N' as i32 && control && shift => BrowserController::open_private_window(),
                 key if key == VK_TAB as i32 && control => BrowserController::next_tab(&self.controller, shift),
@@ -1458,6 +1838,7 @@ wrap_keyboard_handler! {
                 key if key == VK_LEFT as i32 && alt => BrowserController::go_back(&self.controller),
                 key if key == VK_RIGHT as i32 && alt => BrowserController::go_forward(&self.controller),
                 key if key == VK_ESCAPE as i32 => BrowserController::stop_loading(&self.controller),
+                key if key == VK_F11 as i32 => unsafe { platform::toggle_fullscreen(window) },
                 key if key == VK_F12 as i32 => BrowserController::show_dev_tools(&self.controller),
                 key if control && ('1' as i32..='9' as i32).contains(&key) => {
                     let index = (key - '1' as i32) as usize;

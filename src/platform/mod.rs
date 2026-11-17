@@ -1,4 +1,6 @@
 #[cfg(target_os = "windows")]
+mod icons;
+#[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "windows")]

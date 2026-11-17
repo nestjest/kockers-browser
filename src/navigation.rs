@@ -1,3 +1,4 @@
+use crate::storage::SearchEngine;
 use std::fmt;
 use url::Url;
 
@@ -21,7 +22,15 @@ impl fmt::Display for NavigationError {
     }
 }
 
+#[cfg(test)]
 pub fn normalize_input(input: &str) -> Result<Option<String>, NavigationError> {
+    normalize_input_with(input, SearchEngine::Google)
+}
+
+pub fn normalize_input_with(
+    input: &str,
+    engine: SearchEngine,
+) -> Result<Option<String>, NavigationError> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(None);
@@ -42,10 +51,19 @@ pub fn normalize_input(input: &str) -> Result<Option<String>, NavigationError> {
         return parse_http_url(&format!("https://{input}")).map(Some);
     }
 
-    let mut search = Url::parse("https://www.google.com/search")
-        .map_err(|_| NavigationError::InvalidUrl(input.to_owned()))?;
+    search_url(engine, input).map(Some)
+}
+
+pub fn search_url(engine: SearchEngine, input: &str) -> Result<String, NavigationError> {
+    let base = match engine {
+        SearchEngine::Google => "https://www.google.com/search",
+        SearchEngine::Bing => "https://www.bing.com/search",
+        SearchEngine::DuckDuckGo => "https://duckduckgo.com/",
+        SearchEngine::Yandex => "https://yandex.com/search/",
+    };
+    let mut search = Url::parse(base).map_err(|_| NavigationError::InvalidUrl(input.to_owned()))?;
     search.query_pairs_mut().append_pair("q", input);
-    Ok(Some(search.into()))
+    Ok(search.into())
 }
 
 fn parse_http_url(value: &str) -> Result<String, NavigationError> {
@@ -122,6 +140,20 @@ mod tests {
             normalize_input("chromium").unwrap(),
             Some("https://www.google.com/search?q=chromium".to_owned())
         );
+    }
+
+    #[test]
+    fn uses_the_selected_search_engine() {
+        for (engine, expected) in [
+            (SearchEngine::Bing, "https://www.bing.com/search?q=rust"),
+            (SearchEngine::DuckDuckGo, "https://duckduckgo.com/?q=rust"),
+            (SearchEngine::Yandex, "https://yandex.com/search/?q=rust"),
+        ] {
+            assert_eq!(
+                normalize_input_with("rust", engine).unwrap(),
+                Some(expected.to_owned())
+            );
+        }
     }
 
     #[test]
