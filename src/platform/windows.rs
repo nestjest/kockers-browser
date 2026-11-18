@@ -62,7 +62,6 @@ const ACCENT: COLORREF = rgb(0x72, 0x7C, 0x45);
 const WARNING: COLORREF = rgb(0xB2, 0x6A, 0x28);
 const CLOSE_HOVER: COLORREF = rgb(0xC5, 0x42, 0x3B);
 const ID_ADDRESS: usize = 103;
-const ID_OVERLAY: usize = 110;
 const ICON_ID: usize = 1;
 const TAB_ICON_ID: usize = 2;
 const TAB_LIGHT_ICON_ID: usize = 3;
@@ -264,7 +263,6 @@ struct NativeUi {
     drag_tab: Option<u64>,
     drag_origin: POINT,
     dragging: bool,
-    panel_offset: Transition,
     animation_running: bool,
     rounded_by_dwm: bool,
     fullscreen: bool,
@@ -318,7 +316,6 @@ impl NativeUi {
             drag_tab: None,
             drag_origin: POINT::default(),
             dragging: false,
-            panel_offset: Transition::new(0.0),
             animation_running: false,
             rounded_by_dwm: true,
             fullscreen: false,
@@ -351,16 +348,16 @@ impl NativeUi {
                 ID_ADDRESS,
             )?;
             self.overlay_window = CreateWindowExW(
-                0,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 wide("KockersBrowserOverlay").as_ptr(),
                 ptr::null(),
-                WS_CHILD | WS_CLIPSIBLINGS,
+                WS_POPUP,
                 0,
                 0,
                 0,
                 0,
                 self.window,
-                ID_OVERLAY as HMENU,
+                ptr::null_mut(),
                 instance,
                 ptr::null(),
             );
@@ -574,12 +571,11 @@ impl NativeUi {
         };
         let panel_height = desired_height.min((height - content_top - 12).max(90));
         let left = width - panel_width - 12;
-        let top = content_top + self.panel_offset.value.round() as i32;
         RECT {
             left,
-            top,
+            top: content_top,
             right: left + panel_width,
-            bottom: top + panel_height,
+            bottom: content_top + panel_height,
         }
     }
 
@@ -592,7 +588,12 @@ impl NativeUi {
         let height = rect.bottom - rect.top;
         let size_changed = unsafe { client_size(self.overlay_window) } != (width, height);
         unsafe {
-            move_window_if_needed(self.overlay_window, rect.left, rect.top, width, height, 0);
+            let mut origin = POINT {
+                x: rect.left,
+                y: rect.top,
+            };
+            ClientToScreen(self.window, &mut origin);
+            move_window_if_needed(self.overlay_window, origin.x, origin.y, width, height, 0);
             if size_changed {
                 let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 28, 28);
                 if !region.is_null() {
@@ -600,21 +601,6 @@ impl NativeUi {
                 }
                 InvalidateRect(self.overlay_window, ptr::null(), 0);
             }
-        }
-    }
-
-    fn move_panel(&self) {
-        let rect = self.panel_rect();
-        unsafe {
-            SetWindowPos(
-                self.overlay_window,
-                ptr::null_mut(),
-                rect.left,
-                rect.top,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
-            );
         }
     }
 
@@ -674,16 +660,7 @@ impl NativeUi {
         if self.reduce_animations {
             for visual in &mut self.tabs {
                 visual.x.snap(visual.x.target);
-            }
-            self.panel_offset
-                .snap(if self.panel_open { 0.0 } else { 12.0 });
-            if !self.panel_open && self.panel_visible {
-                self.panel_visible = false;
-                if self.panel == Some(PanelKind::Downloads) {
-                    self.downloads = Vec::new();
-                }
-                self.panel = None;
-                unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
+                visual.width.snap(visual.width.target);
             }
         }
         self.hover = Hit::None;
@@ -742,13 +719,6 @@ impl NativeUi {
         self.panel = Some(panel);
         self.panel_open = true;
         self.panel_visible = true;
-        self.panel_offset = if self.reduce_animations {
-            Transition::new(0.0)
-        } else {
-            let mut offset = Transition::new(12.0);
-            offset.set_target(0.0);
-            offset
-        };
         self.refresh_update();
         self.layout_panel();
         unsafe {
@@ -759,27 +729,45 @@ impl NativeUi {
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
             InvalidateRect(self.overlay_window, ptr::null(), 0);
+            UpdateWindow(self.overlay_window);
+            if self.reduce_animations {
+                ShowWindow(self.overlay_window, SW_SHOW);
+            } else {
+                if AnimateWindow(
+                    self.overlay_window,
+                    ANIMATION_DURATION.as_millis() as u32,
+                    AW_BLEND,
+                ) == 0
+                {
+                    ShowWindow(self.overlay_window, SW_SHOW);
+                }
+                SetLayeredWindowAttributes(self.overlay_window, 0, 255, LWA_ALPHA);
+            }
         }
-        self.update_animation_timer();
     }
 
     fn close_panels(&mut self) {
         if self.panel_visible && self.panel_open {
             self.panel_open = false;
-            if self.reduce_animations {
-                self.panel_visible = false;
-                if self.panel == Some(PanelKind::Downloads) {
-                    self.downloads = Vec::new();
+            unsafe {
+                if self.reduce_animations
+                    || AnimateWindow(
+                        self.overlay_window,
+                        ANIMATION_DURATION.as_millis() as u32,
+                        AW_BLEND | AW_HIDE,
+                    ) == 0
+                {
+                    ShowWindow(self.overlay_window, SW_HIDE);
                 }
-                self.panel = None;
-                unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
-            } else {
-                self.panel_offset.set_target(12.0);
             }
-            self.update_animation_timer();
+            self.panel_visible = false;
+            if self.panel == Some(PanelKind::Downloads) {
+                self.downloads = Vec::new();
+            }
+            self.panel = None;
         }
         self.update_update_timer();
     }
@@ -814,8 +802,7 @@ impl NativeUi {
         let needed = self
             .tabs
             .iter()
-            .any(|visual| visual.x.is_active() || visual.width.is_active())
-            || (self.panel_visible && self.panel_offset.is_active());
+            .any(|visual| visual.x.is_active() || visual.width.is_active());
         unsafe {
             if needed && !self.animation_running {
                 SetTimer(
@@ -837,18 +824,6 @@ impl NativeUi {
         let mut repaint_tabs = false;
         for visual in &mut self.tabs {
             repaint_tabs |= visual.x.step(now) | visual.width.step(now);
-        }
-        if self.panel_visible {
-            let panel_animating = self.panel_offset.step(now);
-            self.move_panel();
-            if !self.panel_open && !panel_animating {
-                self.panel_visible = false;
-                if self.panel == Some(PanelKind::Downloads) {
-                    self.downloads = Vec::new();
-                }
-                self.panel = None;
-                unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
-            }
         }
         if repaint_tabs {
             let (width, _) = unsafe { client_size(self.window) };
@@ -1508,7 +1483,6 @@ pub unsafe fn toggle_fullscreen(window: HWND) {
                 ui.downloads = Vec::new();
             }
             ui.panel = None;
-            ui.panel_offset.snap(12.0);
             ui.hover = Hit::None;
             ui.pressed = Hit::None;
             ShowWindow(ui.overlay_window, SW_HIDE);
@@ -1613,6 +1587,18 @@ unsafe extern "system" fn window_proc(
                     paint_toolbar(ui, dc);
                 }
                 EndPaint(window, &paint);
+                return 0;
+            }
+            WM_PRINTCLIENT => {
+                if let Some(ui) = ui_mut(window) {
+                    paint_toolbar(ui, wparam as HDC);
+                }
+                return 0;
+            }
+            WM_MOVE => {
+                if let Some(ui) = ui_mut(window) {
+                    ui.layout_panel();
+                }
                 return 0;
             }
             WM_SIZE | WM_DPICHANGED => {
@@ -1920,9 +1906,19 @@ unsafe extern "system" fn overlay_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe {
-        let parent = GetParent(window);
+        let parent = GetWindow(window, GW_OWNER);
         match message {
             WM_ERASEBKGND => 1,
+            WM_PRINTCLIENT => {
+                if let Some(ui) = ui_mut(parent) {
+                    match ui.panel {
+                        Some(PanelKind::Downloads) => draw_download_panel(ui, wparam as HDC),
+                        Some(PanelKind::Menu) => draw_main_menu(ui, wparam as HDC),
+                        None => {}
+                    }
+                }
+                0
+            }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut paint);
