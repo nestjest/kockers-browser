@@ -174,44 +174,10 @@ impl Transition {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PanelOffset {
-    offset: Transition,
-    opacity: Transition,
-}
-
-impl PanelOffset {
-    fn new(value: f32) -> Self {
-        Self {
-            offset: Transition::new(value),
-            opacity: Transition::new(if value == 0.0 { 1.0 } else { 0.0 }),
-        }
-    }
-
-    fn set_target(&mut self, target: f32) {
-        self.offset.set_target(target);
-        self.opacity
-            .set_target(if target == 0.0 { 1.0 } else { 0.0 });
-    }
-
-    fn snap(&mut self, value: f32) {
-        self.offset.snap(value);
-        self.opacity.snap(if value == 0.0 { 1.0 } else { 0.0 });
-    }
-
-    fn is_active(&self) -> bool {
-        self.offset.is_active() || self.opacity.is_active()
-    }
-
-    fn step(&mut self, now: Instant) -> bool {
-        self.offset.step(now) | self.opacity.step(now)
-    }
-}
-
 struct TabVisual {
     tab: TabSnapshot,
     x: Transition,
-    width: f32,
+    width: Transition,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -298,7 +264,7 @@ struct NativeUi {
     drag_tab: Option<u64>,
     drag_origin: POINT,
     dragging: bool,
-    panel_offset: PanelOffset,
+    panel_offset: Transition,
     animation_running: bool,
     rounded_by_dwm: bool,
     fullscreen: bool,
@@ -352,7 +318,7 @@ impl NativeUi {
             drag_tab: None,
             drag_origin: POINT::default(),
             dragging: false,
-            panel_offset: PanelOffset::new(0.0),
+            panel_offset: Transition::new(0.0),
             animation_running: false,
             rounded_by_dwm: true,
             fullscreen: false,
@@ -385,7 +351,7 @@ impl NativeUi {
                 ID_ADDRESS,
             )?;
             self.overlay_window = CreateWindowExW(
-                WS_EX_LAYERED,
+                0,
                 wide("KockersBrowserOverlay").as_ptr(),
                 ptr::null(),
                 WS_CHILD | WS_CLIPSIBLINGS,
@@ -454,7 +420,9 @@ impl NativeUi {
                 x: previous
                     .map(|visual| visual.x)
                     .unwrap_or_else(|| Transition::new(0.0)),
-                width: previous.map_or(180.0, |visual| visual.width),
+                width: previous
+                    .map(|visual| visual.width)
+                    .unwrap_or_else(|| Transition::new(0.0)),
             });
         }
         self.tabs = visuals;
@@ -479,19 +447,21 @@ impl NativeUi {
         };
         let mut target = origin;
         for visual in &mut self.tabs {
-            visual.width = if visual.tab.pinned {
+            let width = if visual.tab.pinned {
                 pinned_width
             } else {
                 normal_width
             };
+            visual.width.set_target(width);
             if visual.x.value == 0.0 && visual.x.target == 0.0 {
                 visual.x.snap(target);
             }
             visual.x.set_target(target);
             if self.reduce_animations {
                 visual.x.snap(target);
+                visual.width.snap(width);
             }
-            target += visual.width + gap;
+            target += visual.width.target + gap;
         }
     }
 
@@ -604,7 +574,7 @@ impl NativeUi {
         };
         let panel_height = desired_height.min((height - content_top - 12).max(90));
         let left = width - panel_width - 12;
-        let top = content_top + self.panel_offset.offset.value.round() as i32;
+        let top = content_top + self.panel_offset.value.round() as i32;
         RECT {
             left,
             top,
@@ -630,7 +600,6 @@ impl NativeUi {
                 }
                 InvalidateRect(self.overlay_window, ptr::null(), 0);
             }
-            self.update_panel_opacity();
         }
     }
 
@@ -646,14 +615,6 @@ impl NativeUi {
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
             );
-            self.update_panel_opacity();
-        }
-    }
-
-    fn update_panel_opacity(&self) {
-        let alpha = (self.panel_offset.opacity.value.clamp(0.0, 1.0) * 255.0).round() as u8;
-        unsafe {
-            SetLayeredWindowAttributes(self.overlay_window, 0, alpha, LWA_ALPHA);
         }
     }
 
@@ -782,9 +743,9 @@ impl NativeUi {
         self.panel_open = true;
         self.panel_visible = true;
         self.panel_offset = if self.reduce_animations {
-            PanelOffset::new(0.0)
+            Transition::new(0.0)
         } else {
-            let mut offset = PanelOffset::new(12.0);
+            let mut offset = Transition::new(12.0);
             offset.set_target(0.0);
             offset
         };
@@ -850,7 +811,10 @@ impl NativeUi {
     }
 
     fn update_animation_timer(&mut self) {
-        let needed = self.tabs.iter().any(|visual| visual.x.is_active())
+        let needed = self
+            .tabs
+            .iter()
+            .any(|visual| visual.x.is_active() || visual.width.is_active())
             || (self.panel_visible && self.panel_offset.is_active());
         unsafe {
             if needed && !self.animation_running {
@@ -872,7 +836,7 @@ impl NativeUi {
         let now = Instant::now();
         let mut repaint_tabs = false;
         for visual in &mut self.tabs {
-            repaint_tabs |= visual.x.step(now);
+            repaint_tabs |= visual.x.step(now) | visual.width.step(now);
         }
         if self.panel_visible {
             let panel_animating = self.panel_offset.step(now);
@@ -942,7 +906,7 @@ impl NativeUi {
             }
             for visual in &self.tabs {
                 let left = visual.x.value.round() as i32;
-                let right = left + visual.width.round() as i32;
+                let right = left + visual.width.value.round() as i32;
                 if x >= left && x < right && (TAB_TOP..TAB_BOTTOM).contains(&y) {
                     if !visual.tab.pinned && x >= right - 32 {
                         return Hit::TabClose(visual.tab.id);
@@ -1724,7 +1688,7 @@ unsafe extern "system" fn window_proc(
                                 .tabs
                                 .iter()
                                 .position(|visual| {
-                                    let center = visual.x.value + visual.width / 2.0;
+                                    let center = visual.x.value + visual.width.value / 2.0;
                                     (x as f32) < center
                                 })
                                 .unwrap_or(ui.tabs.len().saturating_sub(1));
@@ -2353,7 +2317,7 @@ fn new_tab_rect(ui: &NativeUi) -> RECT {
     let after_tabs = ui
         .tabs
         .last()
-        .map(|visual| visual.x.target + visual.width + 6.0)
+        .map(|visual| visual.x.value + visual.width.value + 6.0)
         .unwrap_or(64.0);
     let left = (after_tabs.round() as i32).min((width - 198).max(64));
     RECT {
@@ -2615,11 +2579,14 @@ unsafe fn draw_bookmarks(ui: &NativeUi, dc: HDC) {
 
 unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
     unsafe {
+        if visual.width.value < 1.0 {
+            return;
+        }
         let x = visual.x.value.round() as i32;
         let rect = RECT {
             left: x,
             top: TAB_TOP,
-            right: x + visual.width.round() as i32,
+            right: x + visual.width.value.round() as i32,
             bottom: TAB_BOTTOM,
         };
         let active = visual.tab.active;
@@ -2639,6 +2606,11 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
             );
         }
         SetBkMode(dc, TRANSPARENT as i32);
+        let saved = SaveDC(dc);
+        if saved == 0 {
+            return;
+        }
+        IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
         if visual.tab.pinned {
             let initial = visual.tab.title.chars().next().unwrap_or('•').to_string();
             draw_text(
@@ -2653,6 +2625,7 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
                 },
                 DT_CENTER,
             );
+            RestoreDC(dc, saved);
             return;
         }
         let mut title_rect = rect;
@@ -2696,6 +2669,7 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
             fill_round_rect(dc, &close, ui.palette.hover, 9, None);
         }
         draw_icon(dc, &close, Icon::Close, ui.palette.secondary);
+        RestoreDC(dc, saved);
     }
 }
 
@@ -2704,7 +2678,17 @@ use super::icons::{Icon, draw_icon};
 unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, enabled: bool) {
     unsafe {
         if enabled && (ui.hover == hit || ui.pressed == hit) {
-            fill_round_rect(dc, &rect, ui.palette.hover, 12, None);
+            if matches!(hit, Hit::Minimize | Hit::Maximize) {
+                let highlight = RECT {
+                    left: rect.left + 5,
+                    top: rect.top + 9,
+                    right: rect.right - 5,
+                    bottom: rect.bottom - 9,
+                };
+                fill_round_rect(dc, &highlight, ui.palette.hover, 10, None);
+            } else {
+                fill_round_rect(dc, &rect, ui.palette.hover, 12, None);
+            }
         }
         draw_icon(
             dc,
@@ -3619,25 +3603,20 @@ mod tests {
     #[test]
     fn panel_transitions_do_not_overshoot() {
         let now = Instant::now();
-        let mut panel = PanelOffset::new(12.0);
+        let mut panel = Transition::new(12.0);
         panel.set_target(0.0);
-        panel.offset.started = now;
-        panel.opacity.started = now;
+        panel.started = now;
         for millisecond in 0..=ANIMATION_DURATION.as_millis() as u64 {
             panel.step(now + Duration::from_millis(millisecond));
-            assert!((0.0..=12.0).contains(&panel.offset.value));
-            assert!((0.0..=1.0).contains(&panel.opacity.value));
+            assert!((0.0..=12.0).contains(&panel.value));
         }
-        assert_eq!(panel.offset.value, 0.0);
-        assert_eq!(panel.opacity.value, 1.0);
+        assert_eq!(panel.value, 0.0);
         assert!(!panel.step(now + ANIMATION_DURATION));
 
         panel.set_target(12.0);
-        panel.offset.started = now + ANIMATION_DURATION;
-        panel.opacity.started = now + ANIMATION_DURATION;
+        panel.started = now + ANIMATION_DURATION;
         assert!(!panel.step(now + ANIMATION_DURATION * 2));
-        assert_eq!(panel.offset.value, 12.0);
-        assert_eq!(panel.opacity.value, 0.0);
+        assert_eq!(panel.value, 12.0);
     }
 
     #[test]
