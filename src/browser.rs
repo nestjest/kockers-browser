@@ -11,7 +11,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::HWND,
-    UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F11, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
+    UI::{
+        Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F11, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
+        WindowsAndMessaging::WS_VISIBLE,
+    },
 };
 
 pub type SharedController = Arc<Mutex<BrowserController>>;
@@ -83,6 +86,13 @@ pub struct BrowserController {
     preferences: storage::Preferences,
     bookmarks: Vec<storage::Bookmark>,
     closing_window: bool,
+    close_after_reveal: Vec<u64>,
+}
+
+enum CloseStep {
+    Close,
+    Replace,
+    Activate(u64),
 }
 
 impl Default for BrowserController {
@@ -100,6 +110,7 @@ impl Default for BrowserController {
             preferences: storage::load_preferences(),
             bookmarks: storage::load_bookmarks(),
             closing_window: false,
+            close_after_reveal: Vec::new(),
         }
     }
 }
@@ -355,12 +366,45 @@ impl BrowserController {
     }
 
     pub fn close_tab(controller: &SharedController, id: u64) {
+        let step = {
+            let state = lock_controller(controller);
+            let Some(index) = state.tabs.iter().position(|tab| tab.id == id) else {
+                return;
+            };
+            if state.tabs[index].closing {
+                return;
+            }
+            let open = |tab: &&Tab| tab.id != id && !tab.closing;
+            if state.closing_window || state.active != Some(id) {
+                CloseStep::Close
+            } else if let Some(next) = state.tabs[index + 1..]
+                .iter()
+                .find(open)
+                .or_else(|| state.tabs[..index].iter().rev().find(open))
+            {
+                CloseStep::Activate(next.id)
+            } else {
+                CloseStep::Replace
+            }
+        };
+        match step {
+            CloseStep::Close => {}
+            CloseStep::Activate(next) => Self::activate_tab(controller, next),
+            CloseStep::Replace => {
+                {
+                    let mut state = lock_controller(controller);
+                    if let Some(tab) = state.tab_mut(id) {
+                        tab.closing = true;
+                    }
+                    state.close_after_reveal.push(id);
+                }
+                Self::new_tab(controller, &pages::start_page_url(), false);
+                return;
+            }
+        }
         let host = {
             let mut state = lock_controller(controller);
             let Some(tab) = state.tab_mut(id) else { return };
-            if tab.closing {
-                return;
-            }
             tab.closing = true;
             tab.browser.as_ref().and_then(Browser::host)
         };
@@ -371,6 +415,34 @@ impl BrowserController {
             }
         } else {
             Self::finish_tab_close(controller, id);
+        }
+    }
+
+    pub fn reveal_active_tab(controller: &SharedController) {
+        let (window, closing) = {
+            let mut state = lock_controller(controller);
+            let ready = match state.active.and_then(|id| state.tab_mut(id)) {
+                Some(tab) if tab.browser.is_some() => {
+                    tab.ready = true;
+                    true
+                }
+                _ => false,
+            };
+            let closing = if ready {
+                std::mem::take(&mut state.close_after_reveal)
+            } else {
+                Vec::new()
+            };
+            for id in &closing {
+                if let Some(tab) = state.tab_mut(*id) {
+                    tab.closing = false;
+                }
+            }
+            (state.window, closing)
+        };
+        apply_visibility(controller, window);
+        for id in closing {
+            Self::close_tab(controller, id);
         }
     }
 
@@ -1258,11 +1330,12 @@ fn create_browser_with_client(
         width,
         height: (height - content_top).max(0),
     };
-    let window_info = WindowInfo {
+    let mut window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
         ..Default::default()
     }
     .set_as_child(sys::HWND(window.cast()), &bounds);
+    window_info.style &= !WS_VISIBLE;
     let settings = BrowserSettings {
         background_color: if storage::load_preferences().theme == storage::Theme::Dark {
             0xFF171917
@@ -1504,13 +1577,10 @@ wrap_life_span_handler! {
                 .and_then(|browser| browser.host())
                 .map(|host| host.window_handle().0.cast::<std::ffi::c_void>());
             let created = lock_controller(&self.controller).on_after_created(browser);
-            if let Some((window, id, active)) = created {
-                if let Some(handle) = handle.filter(|handle| !handle.is_null()) {
-                    platform::apply_browser_visibility(
-                        window,
-                        &[(id, handle)],
-                        active.then_some(id),
-                    );
+            if let Some((window, _, active)) = created {
+                if active && let Some(handle) = handle.filter(|handle| !handle.is_null()) {
+                    platform::stage_browser(window, handle);
+                    platform::schedule_reveal(window, platform::REVEAL_FALLBACK_MS);
                 }
                 platform::refresh_tabs(window);
             }
@@ -1621,18 +1691,19 @@ wrap_load_handler! {
                 let window = {
                     let mut state = lock_controller(&self.controller);
                     let window = state.window;
+                    let active = state.active;
                     let tab = state.tabs.iter_mut().find(|tab| {
                         tab.browser
                             .as_ref()
                             .is_some_and(|browser| browser.identifier() == id)
                     });
-                    tab.map(|tab| {
+                    tab.and_then(|tab| {
                         tab.ready = true;
-                        window
+                        (active == Some(tab.id)).then_some(window)
                     })
                 };
                 if let Some(window) = window {
-                    apply_visibility(&self.controller, window);
+                    platform::schedule_reveal(window, platform::REVEAL_AFTER_LOAD_MS);
                 }
             }
         }
