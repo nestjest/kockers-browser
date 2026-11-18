@@ -302,7 +302,9 @@ impl BrowserController {
             (state.window, state.request_context.clone(), create)
         };
         platform::refresh_tabs(window);
-        platform::sync_active_tab(window);
+        if !background {
+            platform::sync_active_tab(window);
+        }
         if create {
             create_browser(window, controller.clone(), url, context);
         }
@@ -373,9 +375,12 @@ impl BrowserController {
     }
 
     pub fn close_active_tab(controller: &SharedController) {
-        let id = lock_controller(controller).active;
+        let (window, id) = {
+            let state = lock_controller(controller);
+            (state.window, state.active)
+        };
         if let Some(id) = id {
-            Self::close_tab(controller, id);
+            platform::close_tab(window, id);
         }
     }
 
@@ -1002,7 +1007,7 @@ impl BrowserController {
         }
     }
 
-    fn on_after_created(&mut self, browser: Option<&mut Browser>) -> Option<HWND> {
+    fn on_after_created(&mut self, browser: Option<&mut Browser>) -> Option<(HWND, u64, bool)> {
         let browser = browser?;
         if browser.is_popup() != 0 {
             return None;
@@ -1011,7 +1016,7 @@ impl BrowserController {
         let tab = self.tab_mut(id)?;
         tab.browser = Some(browser.clone());
         tab.is_loading = true;
-        Some(self.window)
+        Some((self.window, id, self.active == Some(id)))
     }
 
     fn on_address_change(
@@ -1498,13 +1503,16 @@ wrap_life_span_handler! {
                 .as_ref()
                 .and_then(|browser| browser.host())
                 .map(|host| host.window_handle().0.cast::<std::ffi::c_void>());
-            let window = lock_controller(&self.controller).on_after_created(browser);
-            if let Some(window) = window {
+            let created = lock_controller(&self.controller).on_after_created(browser);
+            if let Some((window, id, active)) = created {
                 if let Some(handle) = handle.filter(|handle| !handle.is_null()) {
-                    platform::apply_browser_visibility(window, &[(0, handle)], None);
+                    platform::apply_browser_visibility(
+                        window,
+                        &[(id, handle)],
+                        active.then_some(id),
+                    );
                 }
                 platform::refresh_tabs(window);
-                platform::sync_active_tab(window);
             }
         }
 

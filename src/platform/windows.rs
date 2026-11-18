@@ -177,6 +177,7 @@ struct TabVisual {
     tab: TabSnapshot,
     x: Transition,
     width: Transition,
+    closing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -401,13 +402,13 @@ impl NativeUi {
         }
     }
 
-    fn refresh_tabs(&mut self) {
+    fn refresh_tabs(&mut self) -> bool {
         let snapshots = lock_controller(&self.controller).tabs_snapshot();
         if snapshots
             .iter()
             .eq(self.tabs.iter().map(|visual| &visual.tab))
         {
-            return;
+            return false;
         }
         let mut visuals = Vec::with_capacity(snapshots.len());
         for tab in snapshots {
@@ -420,11 +421,13 @@ impl NativeUi {
                 width: previous
                     .map(|visual| visual.width)
                     .unwrap_or_else(|| Transition::new(0.0)),
+                closing: previous.is_some_and(|visual| visual.closing),
             });
         }
         self.tabs = visuals;
         self.layout_tabs();
         self.update_animation_timer();
+        true
     }
 
     fn layout_tabs(&mut self) {
@@ -444,7 +447,9 @@ impl NativeUi {
         };
         let mut target = origin;
         for visual in &mut self.tabs {
-            let width = if visual.tab.pinned {
+            let width = if visual.closing {
+                0.0
+            } else if visual.tab.pinned {
                 pinned_width
             } else {
                 normal_width
@@ -458,7 +463,7 @@ impl NativeUi {
                 visual.x.snap(target);
                 visual.width.snap(width);
             }
-            target += visual.width.target + gap;
+            target += visual.width.target + if visual.closing { 0.0 } else { gap };
         }
     }
 
@@ -473,7 +478,7 @@ impl NativeUi {
             move_window_if_needed(
                 self.address,
                 address.left + 34,
-                address.top + 8,
+                address.top + 10,
                 (address.right - address.left - 82).max(60),
                 24,
                 1,
@@ -511,14 +516,26 @@ impl NativeUi {
     }
 
     fn invalidate_toolbar(&self) {
+        self.invalidate_area(0, self.content_top());
+    }
+
+    fn invalidate_tab_strip(&self) {
+        self.invalidate_area(0, TAB_HEIGHT);
+    }
+
+    fn invalidate_navigation(&self) {
+        self.invalidate_area(TAB_HEIGHT, TOOLBAR_HEIGHT);
+    }
+
+    fn invalidate_area(&self, top: i32, bottom: i32) {
         let (width, _) = unsafe { client_size(self.window) };
         let rect = RECT {
             left: 0,
-            top: 0,
+            top,
             right: width,
-            bottom: self.content_top(),
+            bottom,
         };
-        if rect.bottom > 0 {
+        if rect.bottom > rect.top {
             unsafe { InvalidateRect(self.window, &rect, 0) };
         }
     }
@@ -619,10 +636,8 @@ impl NativeUi {
         }
         self.bookmarked = lock_controller(&self.controller).active_is_bookmarked();
         self.close_panels();
-        unsafe {
-            InvalidateRect(self.address, ptr::null(), 1);
-            InvalidateRect(self.window, ptr::null(), 0);
-        }
+        unsafe { InvalidateRect(self.address, ptr::null(), 1) };
+        self.invalidate_navigation();
     }
 
     fn refresh_bookmarks(&mut self) {
@@ -679,14 +694,14 @@ impl NativeUi {
         self.is_loading = loading;
         self.address_editing = false;
         self.update_address(&url);
-        unsafe { InvalidateRect(self.window, ptr::null(), 0) };
     }
 
     fn update_loading_state(&mut self, loading: bool, back: bool, forward: bool) {
         self.is_loading = loading;
         self.can_go_back = back;
         self.can_go_forward = forward;
-        unsafe { InvalidateRect(self.window, ptr::null(), 0) };
+        self.invalidate_tab_strip();
+        self.invalidate_navigation();
     }
 
     fn update_downloads(&mut self) {
@@ -836,6 +851,38 @@ impl NativeUi {
             unsafe { InvalidateRect(self.window, &rect, 0) };
         }
         self.update_animation_timer();
+        let close = self
+            .tabs
+            .iter()
+            .find(|visual| visual.closing && !visual.width.is_active())
+            .map(|visual| visual.tab.id);
+        if let Some(id) = close {
+            BrowserController::close_tab(&self.controller, id);
+        }
+    }
+
+    fn close_tab(&mut self, id: u64) {
+        if self.reduce_animations {
+            BrowserController::close_tab(&self.controller, id);
+            return;
+        }
+        let Some(visual) = self.tabs.iter_mut().find(|visual| visual.tab.id == id) else {
+            return;
+        };
+        if visual.closing {
+            return;
+        }
+        visual.closing = true;
+        self.layout_tabs();
+        self.update_animation_timer();
+        let (width, _) = unsafe { client_size(self.window) };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: TAB_HEIGHT,
+        };
+        unsafe { InvalidateRect(self.window, &rect, 0) };
     }
 
     fn submit_address(&mut self) {
@@ -1180,9 +1227,16 @@ pub(crate) fn apply_browser_visibility(
 }
 
 pub(crate) fn refresh_tabs(window: HWND) {
+    if let Some(ui) = ui_mut(window)
+        && ui.refresh_tabs()
+    {
+        ui.invalidate_tab_strip();
+    }
+}
+
+pub fn close_tab(window: HWND, id: u64) {
     if let Some(ui) = ui_mut(window) {
-        ui.refresh_tabs();
-        unsafe { InvalidateRect(window, ptr::null(), 0) };
+        ui.close_tab(id);
     }
 }
 
@@ -1584,14 +1638,14 @@ unsafe extern "system" fn window_proc(
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut paint);
                 if let Some(ui) = ui_mut(window) {
-                    paint_toolbar(ui, dc);
+                    paint_toolbar(ui, dc, paint.rcPaint.bottom <= TAB_HEIGHT);
                 }
                 EndPaint(window, &paint);
                 return 0;
             }
             WM_PRINTCLIENT => {
                 if let Some(ui) = ui_mut(window) {
-                    paint_toolbar(ui, wparam as HDC);
+                    paint_toolbar(ui, wparam as HDC, false);
                 }
                 return 0;
             }
@@ -1754,8 +1808,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_CLOSE_TAB => {
                 if let Some(ui) = ui_mut(window) {
-                    let controller = ui.controller.clone();
-                    BrowserController::close_tab(&controller, wparam as u64);
+                    ui.close_tab(wparam as u64);
                 }
                 return 0;
             }
@@ -1908,6 +1961,7 @@ unsafe extern "system" fn overlay_proc(
     unsafe {
         let parent = GetWindow(window, GW_OWNER);
         match message {
+            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
             WM_ERASEBKGND => 1,
             WM_PRINTCLIENT => {
                 if let Some(ui) = ui_mut(parent) {
@@ -1979,7 +2033,12 @@ unsafe extern "system" fn overlay_proc(
                 }
                 0
             }
+            WM_LBUTTONDOWN => {
+                SetCapture(window);
+                0
+            }
             WM_LBUTTONUP => {
+                ReleaseCapture();
                 let x = low_word(lparam) as i32;
                 let y = high_word(lparam) as i32;
                 if let Some(ui) = ui_mut(parent) {
@@ -2343,13 +2402,17 @@ fn bookmark_toggle_rect(width: i32) -> RECT {
     }
 }
 
-unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
+unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
     unsafe {
         if ui.fullscreen {
             return;
         }
         let (width, _) = client_size(ui.window);
-        let toolbar_height = ui.content_top();
+        let toolbar_height = if tabs_only {
+            TAB_HEIGHT
+        } else {
+            ui.content_top()
+        };
         let memory = CreateCompatibleDC(dc);
         let bitmap = CreateCompatibleBitmap(dc, width, toolbar_height);
         if memory.is_null() || bitmap.is_null() {
@@ -2381,29 +2444,31 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             ptr::null_mut(),
             DI_NORMAL,
         );
-        let address = address_rect(width);
-        fill_round_rect(memory, &address, ui.palette.surface, 20, None);
-        if ui.current_url.starts_with("http://") {
-            let warning = RECT {
-                left: address.left + 8,
-                top: address.top,
-                right: address.left + 32,
-                bottom: address.bottom,
-            };
-            draw_text(memory, "!", &warning, ui.font, WARNING, DT_CENTER);
+        if !tabs_only {
+            let address = address_rect(width);
+            fill_round_rect(memory, &address, ui.palette.surface, 20, None);
+            if ui.current_url.starts_with("http://") {
+                let warning = RECT {
+                    left: address.left + 8,
+                    top: address.top,
+                    right: address.left + 32,
+                    bottom: address.bottom,
+                };
+                draw_text(memory, "!", &warning, ui.font, WARNING, DT_CENTER);
+            }
+            draw_button(
+                memory,
+                ui,
+                Hit::BookmarkToggle,
+                bookmark_toggle_rect(width),
+                if ui.bookmarked {
+                    Icon::BookmarkFilled
+                } else {
+                    Icon::Bookmark
+                },
+                ui.current_url.starts_with("https://") || ui.current_url.starts_with("http://"),
+            );
         }
-        draw_button(
-            memory,
-            ui,
-            Hit::BookmarkToggle,
-            bookmark_toggle_rect(width),
-            if ui.bookmarked {
-                Icon::BookmarkFilled
-            } else {
-                Icon::Bookmark
-            },
-            ui.current_url.starts_with("https://") || ui.current_url.starts_with("http://"),
-        );
         for visual in &ui.tabs {
             draw_tab(ui, memory, visual);
         }
@@ -2415,59 +2480,61 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             Icon::NewTab,
             true,
         );
-        draw_button(
-            memory,
-            ui,
-            Hit::Back,
-            toolbar_rect(16),
-            Icon::Back,
-            ui.can_go_back,
-        );
-        draw_button(
-            memory,
-            ui,
-            Hit::Forward,
-            toolbar_rect(60),
-            Icon::Forward,
-            ui.can_go_forward,
-        );
-        draw_button(
-            memory,
-            ui,
-            Hit::Reload,
-            toolbar_rect(104),
-            if ui.is_loading {
-                Icon::Close
-            } else {
-                Icon::Reload
-            },
-            true,
-        );
-        draw_button(memory, ui, Hit::Home, toolbar_rect(148), Icon::Home, true);
-        draw_button(
-            memory,
-            ui,
-            Hit::Profile,
-            toolbar_rect(width - 160),
-            Icon::Profile,
-            true,
-        );
-        draw_button(
-            memory,
-            ui,
-            Hit::Downloads,
-            toolbar_rect(width - 108),
-            Icon::Download,
-            true,
-        );
-        draw_button(
-            memory,
-            ui,
-            Hit::Menu,
-            toolbar_rect(width - 56),
-            Icon::Menu,
-            true,
-        );
+        if !tabs_only {
+            draw_button(
+                memory,
+                ui,
+                Hit::Back,
+                toolbar_rect(16),
+                Icon::Back,
+                ui.can_go_back,
+            );
+            draw_button(
+                memory,
+                ui,
+                Hit::Forward,
+                toolbar_rect(60),
+                Icon::Forward,
+                ui.can_go_forward,
+            );
+            draw_button(
+                memory,
+                ui,
+                Hit::Reload,
+                toolbar_rect(104),
+                if ui.is_loading {
+                    Icon::Close
+                } else {
+                    Icon::Reload
+                },
+                true,
+            );
+            draw_button(memory, ui, Hit::Home, toolbar_rect(148), Icon::Home, true);
+            draw_button(
+                memory,
+                ui,
+                Hit::Profile,
+                toolbar_rect(width - 160),
+                Icon::Profile,
+                true,
+            );
+            draw_button(
+                memory,
+                ui,
+                Hit::Downloads,
+                toolbar_rect(width - 108),
+                Icon::Download,
+                true,
+            );
+            draw_button(
+                memory,
+                ui,
+                Hit::Menu,
+                toolbar_rect(width - 56),
+                Icon::Menu,
+                true,
+            );
+        }
         draw_button(
             memory,
             ui,
@@ -2499,7 +2566,9 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             true,
         );
         draw_caption_close(ui, memory, width);
-        draw_bookmarks(ui, memory);
+        if !tabs_only {
+            draw_bookmarks(ui, memory);
+        }
         let divider = RECT {
             left: 0,
             top: toolbar_height - 1,
@@ -3359,7 +3428,7 @@ unsafe fn show_tab_menu(window: HWND, id: u64) {
         if command == MENU_PIN as i32 {
             BrowserController::toggle_pin(&controller, id);
         } else if command == MENU_CLOSE_TAB as i32 {
-            BrowserController::close_tab(&controller, id);
+            close_tab(window, id);
         }
     }
 }
