@@ -2729,16 +2729,20 @@ unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
         };
         let hovered = ui.hover == Hit::CloseWindow || ui.pressed == Hit::CloseWindow;
         if hovered {
-            let brush = CreateSolidBrush(CLOSE_HOVER);
-            FillRect(dc, &rect, brush);
-            DeleteObject(brush as HGDIOBJ);
+            let highlight = RECT {
+                left: rect.left + 5,
+                top: rect.top + 9,
+                right: rect.right - 5,
+                bottom: rect.bottom - 9,
+            };
+            fill_round_rect(dc, &highlight, CLOSE_HOVER, 10, None);
         }
         draw_icon(
             dc,
             &rect,
             Icon::Close,
             if hovered {
-                ui.palette.surface
+                rgb(0xFF, 0xFF, 0xFF)
             } else {
                 ui.palette.foreground
             },
