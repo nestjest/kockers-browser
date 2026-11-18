@@ -1,4 +1,4 @@
-#define AppVersion "0.2.4a"
+#define AppVersion "0.2.4.1"
 #define AppName "Kockers Browser"
 #define AppPublisher "KOCKERS SOCIETY"
 #define AppURL "https://github.com/nestjest/kockers-browser"
@@ -29,10 +29,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 CloseApplications=yes
 RestartApplications=no
-VersionInfoVersion=0.2.4
+VersionInfoVersion=0.2.4.1
 VersionInfoDescription={#AppName} Setup
 VersionInfoProductName={#AppName}
-VersionInfoProductVersion=0.2.4
+VersionInfoProductVersion=0.2.4.1
 VersionInfoProductTextVersion={#AppVersion}
 
 [Files]
