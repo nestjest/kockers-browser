@@ -57,7 +57,7 @@ fn document(_language: Language, title: &str, body: &str, preferences: &Preferen
     let motion = if preferences.reduce_animations {
         "none"
     } else {
-        "glass-in .56s cubic-bezier(.2,1.28,.32,1) both"
+        "page-in .12s linear both"
     };
     format!(
         r#"<!doctype html>
@@ -74,11 +74,11 @@ main{{min-width:0;animation:{motion}}}.heading{{margin:4px 0 24px}}h1{{font-size
 .card{{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid var(--line);border-radius:18px;box-shadow:0 14px 45px #00000009;overflow:hidden;margin-bottom:18px}}
 .row{{display:flex;align-items:center;justify-content:space-between;gap:24px;min-height:62px;padding:14px 20px;border-bottom:1px solid var(--line)}}.row:last-child{{border:0}}.row.stacked{{align-items:stretch;flex-direction:column;gap:10px}}.label{{font-weight:500}}.hint{{display:block;color:var(--muted);font-size:12px;margin-top:4px;line-height:1.45}}
 select,input[type=text],input[type=url],textarea{{border:1px solid var(--line);background:var(--raised);border-radius:10px;padding:9px 11px;outline:none;min-width:180px}}textarea{{width:100%;resize:vertical;min-height:105px;line-height:1.5}}input:focus,textarea:focus,select:focus{{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 15%,transparent)}}
-.switch{{appearance:none;width:42px;height:24px;min-width:42px;border:0;border-radius:20px;background:var(--line);position:relative;cursor:pointer;transition:background .2s;flex:none}}.switch:before{{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 1px 4px #0003;transition:transform .28s cubic-bezier(.2,1.4,.4,1)}}.switch:checked{{background:var(--accent)}}.switch:checked:before{{transform:translateX(18px)}}
-.btn{{border:1px solid var(--line);background:var(--raised);border-radius:10px;padding:9px 14px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:transform .15s,background .15s}}.btn:hover{{background:var(--hover)}}.btn:active{{transform:scale(.97)}}.btn.primary{{background:var(--accent);border-color:var(--accent);color:white}}.btn.danger{{color:#b04d47}}.actions{{display:flex;gap:10px;flex-wrap:wrap}}.note{{padding:14px 18px;color:var(--muted);font-size:12px}}
+.switch{{appearance:none;width:42px;height:24px;min-width:42px;border:0;border-radius:20px;background:var(--line);position:relative;cursor:pointer;transition:background .12s linear;flex:none}}.switch:before{{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 1px 4px #0003;transition:transform .12s linear}}.switch:checked{{background:var(--accent)}}.switch:checked:before{{transform:translateX(18px)}}
+.btn{{border:1px solid var(--line);background:var(--raised);border-radius:10px;padding:9px 14px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:background .12s linear}}.btn:hover{{background:var(--hover)}}.btn.primary{{background:var(--accent);border-color:var(--accent);color:white}}.btn.danger{{color:#b04d47}}.actions{{display:flex;gap:10px;flex-wrap:wrap}}.note{{padding:14px 18px;color:var(--muted);font-size:12px}}
 .profile-banner{{height:210px;background:linear-gradient(125deg,var(--accent),var(--raised));background-size:cover;background-position:center;border-radius:18px 18px 0 0}}.avatar{{width:112px;height:112px;border-radius:50%;margin:-58px 0 14px 24px;border:5px solid var(--surface);background:var(--hover) center/cover;display:grid;place-items:center;font-size:36px;font-weight:600}}.profile-body{{padding:0 24px 24px}}.profile-name{{font-size:23px;font-weight:600;margin:0 0 5px}}.profile-description{{white-space:pre-wrap;color:var(--muted);margin:0 0 20px}}.field{{display:grid;gap:7px;margin-bottom:14px}}.field span{{color:var(--muted);font-size:12px}}
 .history-tools{{display:flex;gap:10px;margin-bottom:18px}}.history-tools input{{flex:1}}.history-entry{{display:grid;grid-template-columns:105px minmax(0,1fr) 36px;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line)}}.history-entry:last-child{{border:0}}.history-time{{color:var(--muted);font-size:12px}}.history-link{{text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.history-url{{display:block;color:var(--muted);font-size:11px;margin-top:3px;overflow:hidden;text-overflow:ellipsis}}.icon-button{{border:0;background:transparent;color:var(--muted);border-radius:8px;padding:8px}}.icon-button:hover{{background:var(--hover);color:var(--text)}}.empty{{text-align:center;color:var(--muted);padding:56px 20px}}
-@keyframes glass-in{{0%{{opacity:0;transform:translateY(20px) scale(.975)}}65%{{opacity:1;transform:translateY(-2px) scale(1.003)}}100%{{opacity:1;transform:none}}}}
+@keyframes page-in{{from{{opacity:0}}to{{opacity:1}}}}
 @media(max-width:850px){{.shell{{grid-template-columns:1fr;padding:20px}}.sidebar{{position:static}}.nav{{grid-template-columns:repeat(2,minmax(0,1fr))}}.brand{{margin-bottom:14px}}}}
 @media(prefers-reduced-motion:reduce){{main{{animation:none}}*{{transition:none!important}}}}
 </style></head><body>{}<script>
@@ -335,8 +335,8 @@ fn settings_html(section: Section, preferences: &Preferences) -> String {
                 tr(language, "Уменьшить анимации", "Reduce animations"),
                 tr(
                     language,
-                    "Отключает упругие эффекты панелей и страниц.",
-                    "Disables spring effects on panels and pages."
+                    "Отключает плавные переходы панелей и страниц.",
+                    "Disables smooth transitions on panels and pages."
                 ),
                 preferences.reduce_animations
             ),
@@ -368,13 +368,13 @@ fn settings_html(section: Section, preferences: &Preferences) -> String {
                 "lazy_restore",
                 tr(
                     language,
-                    "Ленивое восстановление вкладок",
-                    "Lazy tab restoration"
+                    "Откладывать фоновые вкладки",
+                    "Defer background tabs"
                 ),
                 tr(
                     language,
-                    "Загружать восстановленную страницу только при активации.",
-                    "Load restored pages only when activated."
+                    "Не загружать восстановленные и новые фоновые вкладки до активации.",
+                    "Load restored and new background tabs only when activated."
                 ),
                 preferences.lazy_restore
             )

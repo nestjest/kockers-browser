@@ -683,6 +683,7 @@ mod tests {
         assert!(Version::parse("0.2.4a").unwrap() > Version::parse("0.2.4").unwrap());
         assert!(Version::parse("0.2.4a").unwrap() > Version::parse("0.2.4-alpha").unwrap());
         assert!(Version::parse("0.2.4.1").unwrap() > Version::parse("0.2.4a").unwrap());
+        assert!(Version::parse("0.2.4.2").unwrap() > Version::parse("0.2.4.1").unwrap());
     }
 
     #[test]

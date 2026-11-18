@@ -20,7 +20,6 @@ pub type SharedController = Arc<Mutex<BrowserController>>;
 pub struct TabSnapshot {
     pub id: u64,
     pub title: String,
-    pub url: String,
     pub pinned: bool,
     pub active: bool,
     pub loading: bool,
@@ -143,12 +142,32 @@ impl BrowserController {
             .map(|tab| TabSnapshot {
                 id: tab.id,
                 title: tab.title.clone(),
-                url: tab.url.clone(),
                 pinned: tab.pinned,
                 active: self.active == Some(tab.id),
                 loading: tab.is_loading,
             })
             .collect()
+    }
+
+    pub fn active_state(&self) -> (String, bool, bool, bool) {
+        self.active_tab()
+            .map(|tab| {
+                (
+                    tab.url.clone(),
+                    tab.is_loading,
+                    tab.can_go_back,
+                    tab.can_go_forward,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn tab_id_at(&self, index: usize) -> Option<u64> {
+        self.tabs.get(index).map(|tab| tab.id)
+    }
+
+    pub fn last_tab_id(&self) -> Option<u64> {
+        self.tabs.last().map(|tab| tab.id)
     }
 
     pub fn downloads_snapshot(&self) -> Vec<DownloadSnapshot> {
@@ -235,7 +254,7 @@ impl BrowserController {
         background: bool,
         position: Option<usize>,
     ) {
-        let (window, context) = {
+        let (window, context, create) = {
             let mut state = lock_controller(controller);
             if state.closing_window {
                 return;
@@ -275,13 +294,18 @@ impl BrowserController {
             if !background {
                 state.active = Some(id);
             }
-            state.pending.push_back(id);
+            let create = should_create_browser(background, state.preferences.lazy_restore);
+            if create {
+                state.pending.push_back(id);
+            }
             state.persist_session();
-            (state.window, state.request_context.clone())
+            (state.window, state.request_context.clone(), create)
         };
         platform::refresh_tabs(window);
         platform::sync_active_tab(window);
-        create_browser(window, controller.clone(), url, context);
+        if create {
+            create_browser(window, controller.clone(), url, context);
+        }
     }
 
     pub fn activate_tab(controller: &SharedController, id: u64) {
@@ -447,12 +471,6 @@ impl BrowserController {
             state.window
         };
         platform::refresh_tabs(window);
-    }
-
-    pub fn active_navigation(&self) -> (bool, bool) {
-        self.active_tab()
-            .map(|tab| (tab.can_go_back, tab.can_go_forward))
-            .unwrap_or((false, false))
     }
 
     pub fn active_zoom_percent(&self) -> i32 {
@@ -1101,6 +1119,10 @@ impl BrowserController {
         };
         storage::save_session(&session);
     }
+}
+
+fn should_create_browser(background: bool, lazy_restore: bool) -> bool {
+    !background || !lazy_restore
 }
 
 pub fn lock_controller(controller: &SharedController) -> MutexGuard<'_, BrowserController> {
@@ -1858,6 +1880,13 @@ wrap_keyboard_handler! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_background_tabs_are_created_only_when_activated() {
+        assert!(!should_create_browser(true, true));
+        assert!(should_create_browser(true, false));
+        assert!(should_create_browser(false, true));
+    }
 
     #[test]
     fn download_names_cannot_escape_the_target_directory() {

@@ -120,114 +120,97 @@ enum Hit {
     TabClose(u64),
 }
 
-#[derive(Clone, Copy)]
-struct Spring {
-    value: f32,
-    velocity: f32,
-    target: f32,
-}
-
-impl Spring {
-    fn new(value: f32) -> Self {
-        Self {
-            value,
-            velocity: 0.0,
-            target: value,
-        }
-    }
-
-    fn step(&mut self, dt: f32) -> bool {
-        let acceleration = 240.0 * (self.target - self.value) - 19.0 * self.velocity;
-        self.velocity += acceleration * dt;
-        self.value += self.velocity * dt;
-        if (self.target - self.value).abs() < 0.025 && self.velocity.abs() < 0.04 {
-            self.value = self.target;
-            self.velocity = 0.0;
-            false
-        } else {
-            true
-        }
-    }
-}
+const ANIMATION_DURATION: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Copy)]
-struct PanelOffset {
+struct Transition {
     value: f32,
     from: f32,
     target: f32,
-    opacity: f32,
-    opening: bool,
-    settled: bool,
     started: Instant,
 }
 
-impl PanelOffset {
-    const OPEN_DURATION: Duration = Duration::from_millis(420);
-    const CLOSE_DURATION: Duration = Duration::from_millis(140);
-
+impl Transition {
     fn new(value: f32) -> Self {
         Self {
             value,
             from: value,
             target: value,
-            opacity: 1.0,
-            opening: false,
-            settled: true,
             started: Instant::now(),
         }
     }
 
     fn set_target(&mut self, target: f32) {
+        if self.target == target {
+            return;
+        }
         self.from = self.value;
         self.target = target;
-        self.opening = target < self.value;
-        self.settled = false;
         self.started = Instant::now();
-        if self.opening {
-            self.opacity = 0.0;
-        }
+    }
+
+    fn snap(&mut self, value: f32) {
+        self.value = value;
+        self.from = value;
+        self.target = value;
+    }
+
+    fn is_active(&self) -> bool {
+        self.value != self.target
     }
 
     fn step(&mut self, now: Instant) -> bool {
-        if self.settled {
+        if !self.is_active() {
             return false;
         }
-        let duration = if self.opening {
-            Self::OPEN_DURATION
-        } else {
-            Self::CLOSE_DURATION
-        };
-        let progress = (now.duration_since(self.started).as_secs_f32() / duration.as_secs_f32())
-            .clamp(0.0, 1.0);
-        if self.opening {
-            let damping = 0.78_f32;
-            let frequency = 13.5_f32;
-            let damped_frequency = frequency * (1.0 - damping * damping).sqrt();
-            let time = now.duration_since(self.started).as_secs_f32();
-            let envelope = (-damping * frequency * time).exp();
-            let offset = envelope
-                * ((damped_frequency * time).cos()
-                    + damping * frequency / damped_frequency * (damped_frequency * time).sin());
-            self.value = self.target + (self.from - self.target) * offset;
-            self.opacity = (progress * 5.0).clamp(0.0, 1.0);
-        } else {
-            let eased = 1.0 - (1.0 - progress).powi(3);
-            self.value = self.from + (self.target - self.from) * eased;
-            self.opacity = 1.0 - progress;
-        }
+        let progress = (now.duration_since(self.started).as_secs_f32()
+            / ANIMATION_DURATION.as_secs_f32())
+        .clamp(0.0, 1.0);
+        self.value = self.from + (self.target - self.from) * progress;
         if progress >= 1.0 {
-            self.value = self.target;
-            self.opacity = if self.opening { 1.0 } else { 0.0 };
-            self.settled = true;
+            self.snap(self.target);
         }
-        !self.settled
+        self.is_active()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PanelOffset {
+    offset: Transition,
+    opacity: Transition,
+}
+
+impl PanelOffset {
+    fn new(value: f32) -> Self {
+        Self {
+            offset: Transition::new(value),
+            opacity: Transition::new(if value == 0.0 { 1.0 } else { 0.0 }),
+        }
+    }
+
+    fn set_target(&mut self, target: f32) {
+        self.offset.set_target(target);
+        self.opacity
+            .set_target(if target == 0.0 { 1.0 } else { 0.0 });
+    }
+
+    fn snap(&mut self, value: f32) {
+        self.offset.snap(value);
+        self.opacity.snap(if value == 0.0 { 1.0 } else { 0.0 });
+    }
+
+    fn is_active(&self) -> bool {
+        self.offset.is_active() || self.opacity.is_active()
+    }
+
+    fn step(&mut self, now: Instant) -> bool {
+        self.offset.step(now) | self.opacity.step(now)
     }
 }
 
 struct TabVisual {
     tab: TabSnapshot,
-    x: Spring,
-    close_hover: Spring,
+    x: Transition,
     width: f32,
 }
 
@@ -316,9 +299,7 @@ struct NativeUi {
     drag_origin: POINT,
     dragging: bool,
     panel_offset: PanelOffset,
-    hover_amount: Spring,
     animation_running: bool,
-    last_animation: Instant,
     rounded_by_dwm: bool,
     fullscreen: bool,
     restore_rect: RECT,
@@ -372,9 +353,7 @@ impl NativeUi {
             drag_origin: POINT::default(),
             dragging: false,
             panel_offset: PanelOffset::new(0.0),
-            hover_amount: Spring::new(0.0),
             animation_running: false,
-            last_animation: Instant::now(),
             rounded_by_dwm: true,
             fullscreen: false,
             restore_rect: RECT::default(),
@@ -474,10 +453,7 @@ impl NativeUi {
                 tab,
                 x: previous
                     .map(|visual| visual.x)
-                    .unwrap_or_else(|| Spring::new(0.0)),
-                close_hover: previous
-                    .map(|visual| visual.close_hover)
-                    .unwrap_or_else(|| Spring::new(0.0)),
+                    .unwrap_or_else(|| Transition::new(0.0)),
                 width: previous.map_or(180.0, |visual| visual.width),
             });
         }
@@ -509,13 +485,11 @@ impl NativeUi {
                 normal_width
             };
             if visual.x.value == 0.0 && visual.x.target == 0.0 {
-                visual.x.value = target;
-                visual.x.velocity = 0.0;
+                visual.x.snap(target);
             }
-            visual.x.target = target;
+            visual.x.set_target(target);
             if self.reduce_animations {
-                visual.x.value = target;
-                visual.x.velocity = 0.0;
+                visual.x.snap(target);
             }
             target += visual.width + gap;
         }
@@ -630,7 +604,7 @@ impl NativeUi {
         };
         let panel_height = desired_height.min((height - content_top - 12).max(90));
         let left = width - panel_width - 12;
-        let top = content_top + self.panel_offset.value.round() as i32;
+        let top = content_top + self.panel_offset.offset.value.round() as i32;
         RECT {
             left,
             top,
@@ -677,7 +651,7 @@ impl NativeUi {
     }
 
     fn update_panel_opacity(&self) {
-        let alpha = (self.panel_offset.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let alpha = (self.panel_offset.opacity.value.clamp(0.0, 1.0) * 255.0).round() as u8;
         unsafe {
             SetLayeredWindowAttributes(self.overlay_window, 0, alpha, LWA_ALPHA);
         }
@@ -738,18 +712,15 @@ impl NativeUi {
         }
         if self.reduce_animations {
             for visual in &mut self.tabs {
-                visual.x.value = visual.x.target;
-                visual.x.velocity = 0.0;
-                visual.close_hover.value = visual.close_hover.target;
-                visual.close_hover.velocity = 0.0;
+                visual.x.snap(visual.x.target);
             }
-            self.hover_amount.value = self.hover_amount.target;
-            self.hover_amount.velocity = 0.0;
-            self.panel_offset.value = self.panel_offset.target;
-            self.panel_offset.opacity = if self.panel_open { 1.0 } else { 0.0 };
-            self.panel_offset.settled = true;
+            self.panel_offset
+                .snap(if self.panel_open { 0.0 } else { 12.0 });
             if !self.panel_open && self.panel_visible {
                 self.panel_visible = false;
+                if self.panel == Some(PanelKind::Downloads) {
+                    self.downloads = Vec::new();
+                }
                 self.panel = None;
                 unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
             }
@@ -764,16 +735,7 @@ impl NativeUi {
     }
 
     fn sync_active(&mut self) {
-        let (url, loading, back, forward) = {
-            let state = lock_controller(&self.controller);
-            let tab = state.tabs_snapshot().into_iter().find(|tab| tab.active);
-            (
-                tab.as_ref().map(|tab| tab.url.clone()).unwrap_or_default(),
-                tab.as_ref().is_some_and(|tab| tab.loading),
-                state.active_navigation().0,
-                state.active_navigation().1,
-            )
-        };
+        let (url, loading, back, forward) = lock_controller(&self.controller).active_state();
         self.can_go_back = back;
         self.can_go_forward = forward;
         self.is_loading = loading;
@@ -790,8 +752,8 @@ impl NativeUi {
     }
 
     fn update_downloads(&mut self) {
-        self.downloads = lock_controller(&self.controller).downloads_snapshot();
-        if self.panel == Some(PanelKind::Downloads) {
+        if self.panel_visible && self.panel == Some(PanelKind::Downloads) {
+            self.downloads = lock_controller(&self.controller).downloads_snapshot();
             self.layout_panel();
             unsafe { InvalidateRect(self.overlay_window, ptr::null(), 1) };
         }
@@ -814,6 +776,7 @@ impl NativeUi {
             self.downloads = lock_controller(&self.controller).downloads_snapshot();
         } else {
             self.menu_hover = 0;
+            self.downloads = Vec::new();
         }
         self.panel = Some(panel);
         self.panel_open = true;
@@ -847,6 +810,9 @@ impl NativeUi {
             self.panel_open = false;
             if self.reduce_animations {
                 self.panel_visible = false;
+                if self.panel == Some(PanelKind::Downloads) {
+                    self.downloads = Vec::new();
+                }
                 self.panel = None;
                 unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
             } else {
@@ -884,18 +850,10 @@ impl NativeUi {
     }
 
     fn update_animation_timer(&mut self) {
-        let spring_active = |spring: &Spring| {
-            (spring.target - spring.value).abs() > 0.025 || spring.velocity.abs() > 0.04
-        };
-        let needed = self
-            .tabs
-            .iter()
-            .any(|visual| spring_active(&visual.x) || spring_active(&visual.close_hover))
-            || spring_active(&self.hover_amount)
-            || (self.panel_visible && !self.panel_offset.settled);
+        let needed = self.tabs.iter().any(|visual| visual.x.is_active())
+            || (self.panel_visible && self.panel_offset.is_active());
         unsafe {
             if needed && !self.animation_running {
-                self.last_animation = Instant::now();
                 SetTimer(
                     self.window,
                     ANIMATION_TIMER,
@@ -912,47 +870,29 @@ impl NativeUi {
 
     fn animate(&mut self) {
         let now = Instant::now();
-        let dt = now
-            .duration_since(self.last_animation)
-            .as_secs_f32()
-            .clamp(0.0001, 0.05);
-        self.last_animation = now;
         let mut repaint_tabs = false;
         for visual in &mut self.tabs {
-            repaint_tabs |= visual.x.step(dt);
-            visual.close_hover.target = if self.hover == Hit::TabClose(visual.tab.id) {
-                1.0
-            } else {
-                0.0
-            };
-            repaint_tabs |= visual.close_hover.step(dt);
+            repaint_tabs |= visual.x.step(now);
         }
-        let repaint_toolbar = self.hover_amount.step(dt);
         if self.panel_visible {
             let panel_animating = self.panel_offset.step(now);
             self.move_panel();
             if !self.panel_open && !panel_animating {
                 self.panel_visible = false;
+                if self.panel == Some(PanelKind::Downloads) {
+                    self.downloads = Vec::new();
+                }
                 self.panel = None;
                 unsafe { ShowWindow(self.overlay_window, SW_HIDE) };
             }
         }
-        let (width, _) = unsafe { client_size(self.window) };
         if repaint_tabs {
+            let (width, _) = unsafe { client_size(self.window) };
             let rect = RECT {
                 left: 0,
                 top: 0,
                 right: width,
                 bottom: TAB_HEIGHT,
-            };
-            unsafe { InvalidateRect(self.window, &rect, 0) };
-        }
-        if repaint_toolbar {
-            let rect = RECT {
-                left: 0,
-                top: TAB_HEIGHT,
-                right: width,
-                bottom: TOOLBAR_HEIGHT,
             };
             unsafe { InvalidateRect(self.window, &rect, 0) };
         }
@@ -977,17 +917,6 @@ impl NativeUi {
         let hit = self.hit_test(x, y);
         if hit != self.hover {
             self.hover = hit;
-            self.hover_amount.value = if hit == Hit::None { 0.0 } else { 1.0 };
-            self.hover_amount.velocity = 0.0;
-            self.hover_amount.target = self.hover_amount.value;
-            for visual in &mut self.tabs {
-                visual.close_hover.target = if hit == Hit::TabClose(visual.tab.id) {
-                    1.0
-                } else {
-                    0.0
-                };
-            }
-            self.update_animation_timer();
             self.invalidate_toolbar();
         }
         unsafe { track_mouse_leave(self.window) };
@@ -1132,7 +1061,7 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
             IMAGE_ICON,
             32,
             32,
-            LR_DEFAULTCOLOR,
+            LR_DEFAULTCOLOR | LR_SHARED,
         );
         let small_icon = LoadImageW(
             instance,
@@ -1140,7 +1069,7 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
             IMAGE_ICON,
             16,
             16,
-            LR_DEFAULTCOLOR,
+            LR_DEFAULTCOLOR | LR_SHARED,
         );
         let private = lock_controller(&controller).is_private();
         let title = if private {
@@ -1223,7 +1152,7 @@ unsafe fn register_classes(instance: HINSTANCE) -> Result<(), String> {
                 IMAGE_ICON,
                 32,
                 32,
-                LR_DEFAULTCOLOR,
+                LR_DEFAULTCOLOR | LR_SHARED,
             ),
             hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
             hbrBackground: ptr::null_mut(),
@@ -1611,8 +1540,11 @@ pub unsafe fn toggle_fullscreen(window: HWND) {
             ui.fullscreen = true;
             ui.panel_open = false;
             ui.panel_visible = false;
+            if ui.panel == Some(PanelKind::Downloads) {
+                ui.downloads = Vec::new();
+            }
             ui.panel = None;
-            ui.panel_offset.settled = true;
+            ui.panel_offset.snap(12.0);
             ui.hover = Hit::None;
             ui.pressed = Hit::None;
             ShowWindow(ui.overlay_window, SW_HIDE);
@@ -1814,13 +1746,6 @@ unsafe extern "system" fn window_proc(
             WM_MOUSELEAVE => {
                 if let Some(ui) = ui_mut(window) {
                     ui.hover = Hit::None;
-                    ui.hover_amount.value = 0.0;
-                    ui.hover_amount.velocity = 0.0;
-                    ui.hover_amount.target = 0.0;
-                    for visual in &mut ui.tabs {
-                        visual.close_hover.target = 0.0;
-                    }
-                    ui.update_animation_timer();
                     ui.invalidate_toolbar();
                 }
                 return 0;
@@ -1944,12 +1869,6 @@ unsafe extern "system" fn window_proc(
                     && let Some(ui) = ui_mut(window)
                 {
                     ui.hover = Hit::None;
-                    ui.hover_amount.value = 0.0;
-                    ui.hover_amount.velocity = 0.0;
-                    ui.hover_amount.target = 0.0;
-                    for visual in &mut ui.tabs {
-                        visual.close_hover.target = 0.0;
-                    }
                     ui.close_panels();
                     InvalidateRect(window, ptr::null(), 0);
                 }
@@ -2316,9 +2235,9 @@ fn handle_native_shortcut(window: HWND, key: i32) -> bool {
             let id = {
                 let state = lock_controller(&controller);
                 if value == '9' as i32 {
-                    state.tabs_snapshot().last().map(|tab| tab.id)
+                    state.last_tab_id()
                 } else {
-                    state.tabs_snapshot().get(index).map(|tab| tab.id)
+                    state.tab_id_at(index)
                 }
             };
             if let Some(id) = id {
@@ -2773,19 +2692,8 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
             right: rect.right - 6,
             bottom: TAB_BOTTOM - 7,
         };
-        if visual.close_hover.value > 0.01 {
-            let base = if active {
-                ui.palette.surface
-            } else {
-                ui.palette.background
-            };
-            fill_round_rect(
-                dc,
-                &close,
-                mix_color(base, ui.palette.hover, visual.close_hover.value),
-                9,
-                None,
-            );
+        if ui.hover == Hit::TabClose(visual.tab.id) {
+            fill_round_rect(dc, &close, ui.palette.hover, 9, None);
         }
         draw_icon(dc, &close, Icon::Close, ui.palette.secondary);
     }
@@ -2796,18 +2704,7 @@ use super::icons::{Icon, draw_icon};
 unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, enabled: bool) {
     unsafe {
         if enabled && (ui.hover == hit || ui.pressed == hit) {
-            let amount = if ui.pressed == hit {
-                1.0
-            } else {
-                ui.hover_amount.value
-            };
-            fill_round_rect(
-                dc,
-                &rect,
-                mix_color(ui.palette.background, ui.palette.hover, amount),
-                12,
-                None,
-            );
+            fill_round_rect(dc, &rect, ui.palette.hover, 12, None);
         }
         draw_icon(
             dc,
@@ -3703,43 +3600,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spring_overshoots_and_settles_without_permanent_timer_work() {
-        let mut spring = Spring::new(30.0);
-        spring.target = 0.0;
-        let mut overshot = false;
-        for _ in 0..500 {
-            spring.step(0.016);
-            overshot |= spring.value < 0.0;
-        }
-        assert!(overshot);
-        assert_eq!(spring.value, 0.0);
-        assert_eq!(spring.velocity, 0.0);
+    fn transitions_are_linear_bounded_and_finish() {
+        let now = Instant::now();
+        let mut transition = Transition::new(30.0);
+        transition.set_target(0.0);
+        transition.started = now;
+        assert!(transition.step(now + ANIMATION_DURATION / 2));
+        assert!((transition.value - 15.0).abs() < 0.001);
+        assert!(!transition.step(now + ANIMATION_DURATION));
+        assert_eq!(transition.value, 0.0);
+        assert!(!transition.step(now + ANIMATION_DURATION * 2));
     }
 
     #[test]
-    fn panel_springs_open_and_closes_without_permanent_timer_work() {
+    fn panel_transitions_do_not_overshoot() {
         let now = Instant::now();
-        let mut offset = PanelOffset::new(12.0);
-        offset.set_target(0.0);
-        offset.started = now;
-        assert!(offset.step(now + Duration::from_millis(80)));
-        assert!(offset.opacity > 0.0 && offset.opacity < 1.0);
-        let mut overshot = false;
-        for millisecond in 81..PanelOffset::OPEN_DURATION.as_millis() as u64 {
-            offset.step(now + Duration::from_millis(millisecond));
-            overshot |= offset.value < 0.0;
-            assert!((0.0..=1.0).contains(&offset.opacity));
+        let mut panel = PanelOffset::new(12.0);
+        panel.set_target(0.0);
+        panel.offset.started = now;
+        panel.opacity.started = now;
+        for millisecond in 0..=ANIMATION_DURATION.as_millis() as u64 {
+            panel.step(now + Duration::from_millis(millisecond));
+            assert!((0.0..=12.0).contains(&panel.offset.value));
+            assert!((0.0..=1.0).contains(&panel.opacity.value));
         }
-        assert!(overshot);
-        assert!(!offset.step(now + PanelOffset::OPEN_DURATION));
-        assert_eq!(offset.value, 0.0);
-        assert_eq!(offset.opacity, 1.0);
+        assert_eq!(panel.offset.value, 0.0);
+        assert_eq!(panel.opacity.value, 1.0);
+        assert!(!panel.step(now + ANIMATION_DURATION));
 
-        offset.set_target(12.0);
-        offset.started = now + PanelOffset::OPEN_DURATION;
-        assert!(!offset.step(now + PanelOffset::OPEN_DURATION + PanelOffset::CLOSE_DURATION));
-        assert_eq!(offset.value, 12.0);
-        assert_eq!(offset.opacity, 0.0);
+        panel.set_target(12.0);
+        panel.offset.started = now + ANIMATION_DURATION;
+        panel.opacity.started = now + ANIMATION_DURATION;
+        assert!(!panel.step(now + ANIMATION_DURATION * 2));
+        assert_eq!(panel.offset.value, 12.0);
+        assert_eq!(panel.opacity.value, 0.0);
     }
 
     #[test]

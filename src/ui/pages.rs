@@ -71,7 +71,7 @@ fn start_page_html() -> String {
     let animation = if preferences.reduce_animations {
         "none"
     } else {
-        "glass-in .56s cubic-bezier(.2,1.28,.32,1) both"
+        "page-in .12s linear both"
     };
     let placeholder = if english {
         "Address or search"
@@ -88,12 +88,12 @@ body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; paddin
 main {{ position: relative; top: -4vh; width: min(560px, 100%); text-align: center; }}
 .brand {{ animation: {animation}; }} .logo {{ width: 104px; height: 104px; margin: 0 auto 22px; filter: drop-shadow(0 12px 24px #25281a18); }} .logo svg {{ display: block; width: 100%; height: 100%; }}
 h1 {{ margin: 0 0 34px; font-size: 20px; font-weight: 600; letter-spacing: .32em; text-indent: .32em; }}
-form {{ margin: 0; animation: {animation}; animation-delay: .07s; }}
-input {{ width: 100%; height: 54px; border: 1px solid {line}; border-radius: 27px; outline: none; padding: 0 24px; background: {surface}; color: {foreground}; box-shadow: 0 8px 30px #25281a0c; font: 15px "Segoe UI", Arial, sans-serif; transition: border-color .18s, box-shadow .18s, background .18s; }}
+form {{ margin: 0; animation: {animation}; }}
+input {{ width: 100%; height: 54px; border: 1px solid {line}; border-radius: 27px; outline: none; padding: 0 24px; background: {surface}; color: {foreground}; box-shadow: 0 8px 30px #25281a0c; font: 15px "Segoe UI", Arial, sans-serif; transition: border-color .12s linear; }}
 input:focus {{ border-color: #9da36f; box-shadow: 0 10px 34px #25281a14; }} input::placeholder {{ color: {muted}; }}
 .update {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 12px 16px; border: 1px solid {line}; border-radius: 14px; background: {surface}; color: {muted}; font-size: 13px; text-align: left; animation: {animation}; }}
 .update a {{ flex: none; border-radius: 8px; padding: 7px 10px; color: {foreground}; font-weight: 600; text-decoration: none; }} .update a:hover {{ background: {hover}; }}
-@keyframes glass-in {{ 0% {{ opacity: 0; transform: translateY(24px) scale(.97); }} 68% {{ opacity: 1; transform: translateY(-2px) scale(1.003); }} 100% {{ opacity: 1; transform: none; }} }}
+@keyframes page-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
 @media (prefers-reduced-motion: reduce) {{ .brand, form, .update {{ animation: none; }} input {{ transition: none; }} }}
 </style></head><body><main><div class="brand"><div class="logo">{logo_svg}</div><h1>KOCKERS</h1></div>
 <form id="navigation"><input id="address" type="text" autofocus autocomplete="off" spellcheck="false" aria-label="{placeholder}" placeholder="{placeholder}"></form>{update_notice}</main>
