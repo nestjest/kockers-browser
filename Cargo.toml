@@ -1,6 +1,6 @@
 [package]
 name = "kockers_browser"
-version = "0.2.4"
+version = "0.2.4-alpha"
 edition = "2024"
 publish = false
 build = "build.rs"

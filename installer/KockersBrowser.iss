@@ -1,4 +1,4 @@
-#define AppVersion "0.2.4"
+#define AppVersion "0.2.4a"
 #define AppName "Kockers Browser"
 #define AppPublisher "KOCKERS SOCIETY"
 #define AppURL "https://github.com/nestjest/kockers-browser"

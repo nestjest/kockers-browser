@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "kockers_browser"
-version = "0.2.4"
+version = "0.2.4-alpha"
 dependencies = [
  "cef",
  "url",

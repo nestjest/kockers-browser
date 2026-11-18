@@ -40,10 +40,14 @@ use windows_sys::Win32::{
     },
 };
 
-pub const TAB_HEIGHT: i32 = 44;
-pub const TOOLBAR_HEIGHT: i32 = 108;
+pub const TAB_HEIGHT: i32 = 54;
+pub const TOOLBAR_HEIGHT: i32 = 114;
+const TAB_TOP: i32 = 10;
+const TAB_BOTTOM: i32 = 50;
+const TAB_MAX_WIDTH: f32 = 160.0;
+const EDGE_MARGIN: i32 = 16;
 const BOOKMARKS_HEIGHT: i32 = 36;
-const TOOLBAR_GAP: i32 = 12;
+const TOOLBAR_GAP: i32 = 8;
 const INITIAL_WIDTH: i32 = 1200;
 const INITIAL_HEIGHT: i32 = 800;
 const MIN_WIDTH: i32 = 680;
@@ -70,6 +74,7 @@ const WM_DESTROY_TAB: u32 = WM_APP + 3;
 const WM_CLOSE_PANELS: u32 = WM_APP + 4;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWA_BORDER_COLOR: u32 = 34;
+const DWMWCP_DONOTROUND: u32 = 1;
 const DWMWCP_ROUND: u32 = 2;
 const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFF;
 const MENU_PRIVATE: usize = 2001;
@@ -483,8 +488,8 @@ impl NativeUi {
 
     fn layout_tabs(&mut self) {
         let (width, _) = unsafe { client_size(self.window) };
-        let origin = 52.0;
-        let available = (width as f32 - 232.0).max(80.0);
+        let origin = 64.0;
+        let available = (width as f32 - 248.0).max(80.0);
         let pinned = self.tabs.iter().filter(|visual| visual.tab.pinned).count();
         let normal = self.tabs.len().saturating_sub(pinned);
         let gap = if self.tabs.is_empty() { 0.0 } else { 5.0 };
@@ -494,7 +499,7 @@ impl NativeUi {
         } else {
             ((available - pinned as f32 * (pinned_width + gap) - normal as f32 * gap)
                 / normal as f32)
-                .clamp(1.0, 224.0)
+                .clamp(1.0, TAB_MAX_WIDTH)
         };
         let mut target = origin;
         for visual in &mut self.tabs {
@@ -520,7 +525,7 @@ impl NativeUi {
         if self.address.is_null() {
             return;
         }
-        let (width, height) = unsafe { client_size(self.window) };
+        let (width, _) = unsafe { client_size(self.window) };
         self.layout_tabs();
         unsafe {
             let address = address_rect(width);
@@ -534,16 +539,46 @@ impl NativeUi {
             );
             self.layout_panel();
             lock_controller(&self.controller).resize_content();
-            if !self.rounded_by_dwm {
-                if IsZoomed(self.window) != 0 {
-                    SetWindowRgn(self.window, ptr::null_mut(), 1);
-                } else {
-                    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 16, 16);
-                    if !region.is_null() {
-                        SetWindowRgn(self.window, region, 1);
-                    }
+        }
+        self.update_window_rounding();
+    }
+
+    fn update_window_rounding(&mut self) {
+        unsafe {
+            let (width, height) = client_size(self.window);
+            let preference = if self.fullscreen {
+                DWMWCP_DONOTROUND
+            } else {
+                DWMWCP_ROUND
+            };
+            if self.rounded_by_dwm {
+                DwmSetWindowAttribute(
+                    self.window,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &preference as *const u32 as *const c_void,
+                    mem::size_of::<u32>() as u32,
+                );
+            } else if self.fullscreen || IsZoomed(self.window) != 0 {
+                SetWindowRgn(self.window, ptr::null_mut(), 1);
+            } else {
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 16, 16);
+                if !region.is_null() {
+                    SetWindowRgn(self.window, region, 1);
                 }
             }
+        }
+    }
+
+    fn invalidate_toolbar(&self) {
+        let (width, _) = unsafe { client_size(self.window) };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: self.content_top(),
+        };
+        if rect.bottom > 0 {
+            unsafe { InvalidateRect(self.window, &rect, 0) };
         }
     }
 
@@ -562,11 +597,11 @@ impl NativeUi {
 
     fn bookmark_rects(&self) -> Vec<RECT> {
         let (width, _) = unsafe { client_size(self.window) };
-        let item_width = 150.min((width - 24).max(80));
+        let item_width = 150.min((width - EDGE_MARGIN * 2).max(80));
         let mut rects = Vec::new();
         for index in 0..self.bookmarks.len() {
-            let left = 12 + index as i32 * (item_width + 6);
-            if left + item_width > width - 12 {
+            let left = EDGE_MARGIN + index as i32 * (item_width + 6);
+            if left + item_width > width - EDGE_MARGIN {
                 break;
             }
             rects.push(RECT {
@@ -945,22 +980,32 @@ impl NativeUi {
             self.hover_amount.value = if hit == Hit::None { 0.0 } else { 1.0 };
             self.hover_amount.velocity = 0.0;
             self.hover_amount.target = self.hover_amount.value;
+            for visual in &mut self.tabs {
+                visual.close_hover.target = if hit == Hit::TabClose(visual.tab.id) {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
             self.update_animation_timer();
-            unsafe { InvalidateRect(self.window, ptr::null(), 0) };
+            self.invalidate_toolbar();
         }
         unsafe { track_mouse_leave(self.window) };
     }
 
     fn hit_test(&self, x: i32, y: i32) -> Hit {
+        if self.fullscreen {
+            return Hit::None;
+        }
         let (width, _) = unsafe { client_size(self.window) };
         if y < TAB_HEIGHT {
-            if x >= width - 46 {
+            if x >= width - EDGE_MARGIN - 46 {
                 return Hit::CloseWindow;
             }
-            if x >= width - 92 {
+            if x >= width - EDGE_MARGIN - 92 {
                 return Hit::Maximize;
             }
-            if x >= width - 138 {
+            if x >= width - EDGE_MARGIN - 138 {
                 return Hit::Minimize;
             }
             if point_in_rect(x, y, &new_tab_rect(self)) {
@@ -969,7 +1014,7 @@ impl NativeUi {
             for visual in &self.tabs {
                 let left = visual.x.value.round() as i32;
                 let right = left + visual.width.round() as i32;
-                if x >= left && x < right && (8..36).contains(&y) {
+                if x >= left && x < right && (TAB_TOP..TAB_BOTTOM).contains(&y) {
                     if !visual.tab.pinned && x >= right - 32 {
                         return Hit::TabClose(visual.tab.id);
                     }
@@ -981,13 +1026,13 @@ impl NativeUi {
                 return Hit::BookmarkToggle;
             }
             for (hit, rect) in [
-                (Hit::Back, toolbar_rect(12)),
-                (Hit::Forward, toolbar_rect(56)),
-                (Hit::Reload, toolbar_rect(100)),
-                (Hit::Home, toolbar_rect(144)),
-                (Hit::Profile, toolbar_rect(width - 156)),
-                (Hit::Downloads, toolbar_rect(width - 104)),
-                (Hit::Menu, toolbar_rect(width - 52)),
+                (Hit::Back, toolbar_rect(16)),
+                (Hit::Forward, toolbar_rect(60)),
+                (Hit::Reload, toolbar_rect(104)),
+                (Hit::Home, toolbar_rect(148)),
+                (Hit::Profile, toolbar_rect(width - 160)),
+                (Hit::Downloads, toolbar_rect(width - 108)),
+                (Hit::Menu, toolbar_rect(width - 56)),
             ] {
                 if point_in_rect(x, y, &rect) {
                     return hit;
@@ -1549,6 +1594,7 @@ pub unsafe fn toggle_fullscreen(window: HWND) {
     unsafe {
         if ui.fullscreen {
             ui.fullscreen = false;
+            ui.update_window_rounding();
             let rect = ui.restore_rect;
             SetWindowPos(
                 window,
@@ -1559,9 +1605,19 @@ pub unsafe fn toggle_fullscreen(window: HWND) {
                 rect.bottom - rect.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            ShowWindow(ui.address, SW_SHOW);
         } else {
             GetWindowRect(window, &mut ui.restore_rect);
             ui.fullscreen = true;
+            ui.panel_open = false;
+            ui.panel_visible = false;
+            ui.panel = None;
+            ui.panel_offset.settled = true;
+            ui.hover = Hit::None;
+            ui.pressed = Hit::None;
+            ShowWindow(ui.overlay_window, SW_HIDE);
+            ShowWindow(ui.address, SW_HIDE);
+            ui.update_window_rounding();
             let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
             let mut info = MONITORINFO {
                 cbSize: mem::size_of::<MONITORINFO>() as u32,
@@ -1579,7 +1635,9 @@ pub unsafe fn toggle_fullscreen(window: HWND) {
                 );
             }
         }
+        ui.update_animation_timer();
         ui.layout();
+        ui.invalidate_toolbar();
     }
 }
 
@@ -1656,9 +1714,6 @@ unsafe extern "system" fn window_proc(
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut paint);
                 if let Some(ui) = ui_mut(window) {
-                    let mut client = RECT::default();
-                    GetClientRect(window, &mut client);
-                    FillRect(dc, &client, ui.background_brush);
                     paint_toolbar(ui, dc);
                 }
                 EndPaint(window, &paint);
@@ -1686,6 +1741,27 @@ unsafe extern "system" fn window_proc(
                 let info = &mut *(lparam as *mut MINMAXINFO);
                 info.ptMinTrackSize.x = MIN_WIDTH;
                 info.ptMinTrackSize.y = MIN_HEIGHT;
+                let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+                let mut monitor_info = MONITORINFO {
+                    cbSize: mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(monitor, &mut monitor_info) != 0 {
+                    let monitor_rect = monitor_info.rcMonitor;
+                    if ui_mut(window).is_some_and(|ui| ui.fullscreen) {
+                        info.ptMaxPosition.x = 0;
+                        info.ptMaxPosition.y = 0;
+                        info.ptMaxSize.x = monitor_rect.right - monitor_rect.left;
+                        info.ptMaxSize.y = monitor_rect.bottom - monitor_rect.top;
+                    } else {
+                        let work = monitor_info.rcWork;
+                        info.ptMaxPosition.x = work.left - monitor_rect.left;
+                        info.ptMaxPosition.y = work.top - monitor_rect.top;
+                        info.ptMaxSize.x = work.right - work.left;
+                        info.ptMaxSize.y = work.bottom - work.top;
+                    }
+                    info.ptMaxTrackSize = info.ptMaxSize;
+                }
                 return 0;
             }
             WM_TIMER if wparam == ANIMATION_TIMER => {
@@ -1741,8 +1817,11 @@ unsafe extern "system" fn window_proc(
                     ui.hover_amount.value = 0.0;
                     ui.hover_amount.velocity = 0.0;
                     ui.hover_amount.target = 0.0;
+                    for visual in &mut ui.tabs {
+                        visual.close_hover.target = 0.0;
+                    }
                     ui.update_animation_timer();
-                    InvalidateRect(window, ptr::null(), 0);
+                    ui.invalidate_toolbar();
                 }
                 return 0;
             }
@@ -1766,7 +1845,7 @@ unsafe extern "system" fn window_proc(
                         ui.dragging = false;
                     }
                     SetCapture(window);
-                    InvalidateRect(window, ptr::null(), 0);
+                    ui.invalidate_toolbar();
                 }
                 return 0;
             }
@@ -1784,7 +1863,7 @@ unsafe extern "system" fn window_proc(
                     if !dragging && pressed == hit {
                         ui.activate_hit(hit);
                     }
-                    InvalidateRect(window, ptr::null(), 0);
+                    ui.invalidate_toolbar();
                 }
                 return 0;
             }
@@ -1868,6 +1947,9 @@ unsafe extern "system" fn window_proc(
                     ui.hover_amount.value = 0.0;
                     ui.hover_amount.velocity = 0.0;
                     ui.hover_amount.target = 0.0;
+                    for visual in &mut ui.tabs {
+                        visual.close_hover.target = 0.0;
+                    }
                     ui.close_panels();
                     InvalidateRect(window, ptr::null(), 0);
                 }
@@ -2257,6 +2339,9 @@ unsafe fn subclass_control(control: HWND) {
 
 unsafe fn non_client_hit_test(window: HWND, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if ui_mut(window).is_some_and(|ui| ui.fullscreen) {
+            return HTCLIENT as LRESULT;
+        }
         let mut point = POINT {
             x: low_word(lparam) as i32,
             y: high_word(lparam) as i32,
@@ -2350,21 +2435,21 @@ fn new_tab_rect(ui: &NativeUi) -> RECT {
         .tabs
         .last()
         .map(|visual| visual.x.target + visual.width + 6.0)
-        .unwrap_or(52.0);
-    let left = (after_tabs.round() as i32).min((width - 182).max(52));
+        .unwrap_or(64.0);
+    let left = (after_tabs.round() as i32).min((width - 198).max(64));
     RECT {
         left,
-        top: 8,
+        top: TAB_TOP,
         right: left + 36,
-        bottom: 36,
+        bottom: TAB_BOTTOM,
     }
 }
 
 fn address_rect(width: i32) -> RECT {
     RECT {
-        left: 192,
+        left: 196,
         top: TAB_HEIGHT + TOOLBAR_GAP,
-        right: (width - 212).max(292),
+        right: (width - 216).max(296),
         bottom: TOOLBAR_HEIGHT - TOOLBAR_GAP,
     }
 }
@@ -2381,10 +2466,22 @@ fn bookmark_toggle_rect(width: i32) -> RECT {
 
 unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
     unsafe {
+        if ui.fullscreen {
+            return;
+        }
         let (width, _) = client_size(ui.window);
         let toolbar_height = ui.content_top();
         let memory = CreateCompatibleDC(dc);
         let bitmap = CreateCompatibleBitmap(dc, width, toolbar_height);
+        if memory.is_null() || bitmap.is_null() {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap as HGDIOBJ);
+            }
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+            return;
+        }
         let old_bitmap = SelectObject(memory, bitmap as HGDIOBJ);
         let rect = RECT {
             left: 0,
@@ -2396,8 +2493,8 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
         SetBkMode(memory, TRANSPARENT as i32);
         DrawIconEx(
             memory,
-            15,
-            8,
+            16,
+            (TAB_TOP + TAB_BOTTOM - 28) / 2,
             ui.logo_icon,
             28,
             28,
@@ -2443,7 +2540,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             memory,
             ui,
             Hit::Back,
-            toolbar_rect(12),
+            toolbar_rect(16),
             Icon::Back,
             ui.can_go_back,
         );
@@ -2451,7 +2548,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             memory,
             ui,
             Hit::Forward,
-            toolbar_rect(56),
+            toolbar_rect(60),
             Icon::Forward,
             ui.can_go_forward,
         );
@@ -2459,7 +2556,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             memory,
             ui,
             Hit::Reload,
-            toolbar_rect(100),
+            toolbar_rect(104),
             if ui.is_loading {
                 Icon::Close
             } else {
@@ -2467,12 +2564,12 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             },
             true,
         );
-        draw_button(memory, ui, Hit::Home, toolbar_rect(144), Icon::Home, true);
+        draw_button(memory, ui, Hit::Home, toolbar_rect(148), Icon::Home, true);
         draw_button(
             memory,
             ui,
             Hit::Profile,
-            toolbar_rect(width - 156),
+            toolbar_rect(width - 160),
             Icon::Profile,
             true,
         );
@@ -2480,7 +2577,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             memory,
             ui,
             Hit::Downloads,
-            toolbar_rect(width - 104),
+            toolbar_rect(width - 108),
             Icon::Download,
             true,
         );
@@ -2488,7 +2585,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             memory,
             ui,
             Hit::Menu,
-            toolbar_rect(width - 52),
+            toolbar_rect(width - 56),
             Icon::Menu,
             true,
         );
@@ -2497,9 +2594,9 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             ui,
             Hit::Minimize,
             RECT {
-                left: width - 138,
+                left: width - EDGE_MARGIN - 138,
                 top: 0,
-                right: width - 92,
+                right: width - EDGE_MARGIN - 92,
                 bottom: TAB_HEIGHT,
             },
             Icon::Minimize,
@@ -2510,9 +2607,9 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC) {
             ui,
             Hit::Maximize,
             RECT {
-                left: width - 92,
+                left: width - EDGE_MARGIN - 92,
                 top: 0,
-                right: width - 46,
+                right: width - EDGE_MARGIN - 46,
                 bottom: TAB_HEIGHT,
             },
             if IsZoomed(ui.window) != 0 {
@@ -2547,9 +2644,9 @@ unsafe fn draw_bookmarks(ui: &NativeUi, dc: HDC) {
     unsafe {
         if ui.bookmarks.is_empty() {
             let empty = RECT {
-                left: 14,
+                left: EDGE_MARGIN,
                 top: TOOLBAR_HEIGHT,
-                right: client_size(ui.window).0 - 14,
+                right: client_size(ui.window).0 - EDGE_MARGIN,
                 bottom: TOOLBAR_HEIGHT + BOOKMARKS_HEIGHT,
             };
             draw_text(
@@ -2602,9 +2699,9 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
         let x = visual.x.value.round() as i32;
         let rect = RECT {
             left: x,
-            top: 8,
+            top: TAB_TOP,
             right: x + visual.width.round() as i32,
-            bottom: 36,
+            bottom: TAB_BOTTOM,
         };
         let active = visual.tab.active;
         let hovered =
@@ -2657,9 +2754,9 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
         if visual.tab.loading {
             let indicator = RECT {
                 left: rect.left + 6,
-                top: rect.top + 4,
+                top: rect.top + 11,
                 right: rect.left + 24,
-                bottom: rect.top + 22,
+                bottom: rect.top + 29,
             };
             draw_text(
                 dc,
@@ -2672,9 +2769,9 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
         }
         let close = RECT {
             left: rect.right - 32,
-            top: 9,
+            top: TAB_TOP + 7,
             right: rect.right - 6,
-            bottom: 35,
+            bottom: TAB_BOTTOM - 7,
         };
         if visual.close_hover.value > 0.01 {
             let base = if active {
@@ -2728,9 +2825,9 @@ unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, 
 unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
     unsafe {
         let rect = RECT {
-            left: width - 46,
+            left: width - EDGE_MARGIN - 46,
             top: 0,
-            right: width,
+            right: width - EDGE_MARGIN,
             bottom: TAB_HEIGHT,
         };
         let hovered = ui.hover == Hit::CloseWindow || ui.pressed == Hit::CloseWindow;

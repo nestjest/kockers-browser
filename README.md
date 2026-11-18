@@ -4,7 +4,7 @@
 
 ## Установка для пользователей Windows
 
-1. Скачайте `KockersBrowser-0.2.4-windows-x64-setup.exe` из [релиза 0.2.4](https://github.com/nestjest/kockers-browser/releases/tag/v0.2.4).
+1. Скачайте `KockersBrowser-0.2.4a-windows-x64-setup.exe` из [релиза 0.2.4a](https://github.com/nestjest/kockers-browser/releases/tag/v0.2.4a).
 2. Запустите установщик и следуйте шагам мастера. Установка выполняется для текущего пользователя и не требует прав администратора.
 3. По умолчанию браузер устанавливается в `%LOCALAPPDATA%\Programs\Kockers Browser`; ярлык создаётся в меню «Пуск».
 

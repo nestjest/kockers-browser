@@ -558,11 +558,19 @@ struct Version {
     minor: u64,
     patch: u64,
     revision: u64,
+    post_alpha: bool,
     prerelease: Option<String>,
 }
 
 impl Version {
     fn parse(value: &str) -> Result<Self, String> {
+        let (value, post_alpha) = if value.contains('-') {
+            (value, false)
+        } else {
+            value
+                .strip_suffix('a')
+                .map_or((value, false), |numeric| (numeric, true))
+        };
         let (numeric, prerelease) = value
             .split_once('-')
             .map(|(numeric, prerelease)| (numeric, Some(prerelease)))
@@ -573,6 +581,7 @@ impl Version {
                 .iter()
                 .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
             || prerelease.is_some_and(|part| part.is_empty())
+            || (post_alpha && prerelease.is_some())
         {
             return Err(format!("Некорректная версия: {value}"));
         }
@@ -592,6 +601,7 @@ impl Version {
                 .transpose()
                 .map_err(|_| "Слишком большая hotfix-версия")?
                 .unwrap_or(0),
+            post_alpha,
             prerelease: prerelease.map(str::to_owned),
         })
     }
@@ -613,6 +623,7 @@ impl Version {
     fn cmp_numeric(&self, other: &Self) -> std::cmp::Ordering {
         (self.major, self.minor, self.patch, self.revision)
             .cmp(&(other.major, other.minor, other.patch, other.revision))
+            .then_with(|| self.post_alpha.cmp(&other.post_alpha))
             .then_with(|| match (&self.prerelease, &other.prerelease) {
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -669,6 +680,9 @@ mod tests {
         assert!(Version::parse("0.1.0").unwrap() > Version::parse("0.1.0-rc.1").unwrap());
         assert!(Version::parse("0.2.2.1").unwrap() > Version::parse("0.2.2-alpha").unwrap());
         assert!(Version::parse("0.2.2.2").unwrap() > Version::parse("0.2.2.1").unwrap());
+        assert!(Version::parse("0.2.4a").unwrap() > Version::parse("0.2.4").unwrap());
+        assert!(Version::parse("0.2.4a").unwrap() > Version::parse("0.2.4-alpha").unwrap());
+        assert!(Version::parse("0.2.4.1").unwrap() > Version::parse("0.2.4a").unwrap());
     }
 
     #[test]
