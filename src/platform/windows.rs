@@ -12,7 +12,11 @@ use std::{
     iter, mem,
     path::{Path, PathBuf},
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    thread,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -20,7 +24,10 @@ use windows_sys::Win32::{
         COLORREF, ERROR_CLASS_ALREADY_EXISTS, FreeLibrary, GetLastError, HINSTANCE, HWND, LPARAM,
         LRESULT, POINT, RECT, WPARAM,
     },
-    Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*},
+    Graphics::{
+        Dwm::{DwmFlush, DwmSetWindowAttribute},
+        Gdi::*,
+    },
     System::{
         Com::CoTaskMemFree,
         LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
@@ -65,12 +72,14 @@ const ID_ADDRESS: usize = 103;
 const ICON_ID: usize = 1;
 const TAB_ICON_ID: usize = 2;
 const TAB_LIGHT_ICON_ID: usize = 3;
-const ANIMATION_TIMER: usize = 1;
 const UPDATE_TIMER: usize = 2;
+const REVEAL_TIMER: usize = 3;
 const WM_CLOSE_TAB: u32 = WM_APP + 1;
 const WM_FINALIZE_TAB: u32 = WM_APP + 2;
 const WM_DESTROY_TAB: u32 = WM_APP + 3;
 const WM_CLOSE_PANELS: u32 = WM_APP + 4;
+const WM_COMMIT_CLOSE_TAB: u32 = WM_APP + 5;
+const WM_ANIMATION_FRAME: u32 = WM_APP + 6;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWA_BORDER_COLOR: u32 = 34;
 const DWMWCP_DONOTROUND: u32 = 1;
@@ -265,6 +274,7 @@ struct NativeUi {
     drag_origin: POINT,
     dragging: bool,
     animation_running: bool,
+    frame_clock: Arc<FrameClock>,
     rounded_by_dwm: bool,
     fullscreen: bool,
     restore_rect: RECT,
@@ -318,6 +328,7 @@ impl NativeUi {
             drag_origin: POINT::default(),
             dragging: false,
             animation_running: false,
+            frame_clock: Arc::default(),
             rounded_by_dwm: true,
             fullscreen: false,
             restore_rect: RECT::default(),
@@ -818,19 +829,13 @@ impl NativeUi {
             .tabs
             .iter()
             .any(|visual| visual.x.is_active() || visual.width.is_active());
-        unsafe {
-            if needed && !self.animation_running {
-                SetTimer(
-                    self.window,
-                    ANIMATION_TIMER,
-                    animation_interval(self.window),
-                    None,
-                );
-                self.animation_running = true;
-            } else if !needed && self.animation_running {
-                KillTimer(self.window, ANIMATION_TIMER);
-                self.animation_running = false;
-            }
+        if needed && !self.animation_running {
+            self.frame_clock
+                .start(self.window, animation_interval(self.window));
+            self.animation_running = true;
+        } else if !needed && self.animation_running {
+            self.frame_clock.stop();
+            self.animation_running = false;
         }
     }
 
@@ -857,13 +862,19 @@ impl NativeUi {
             .find(|visual| visual.closing && !visual.width.is_active())
             .map(|visual| visual.tab.id);
         if let Some(id) = close {
-            BrowserController::close_tab(&self.controller, id);
+            unsafe { PostMessageW(self.window, WM_COMMIT_CLOSE_TAB, id as WPARAM, 0) };
         }
     }
 
     fn close_tab(&mut self, id: u64) {
+        let last = self
+            .tabs
+            .iter()
+            .all(|visual| visual.closing || visual.tab.id == id);
+        if last || self.reduce_animations {
+            unsafe { PostMessageW(self.window, WM_COMMIT_CLOSE_TAB, id as WPARAM, 0) };
+        }
         if self.reduce_animations {
-            BrowserController::close_tab(&self.controller, id);
             return;
         }
         let Some(visual) = self.tabs.iter_mut().find(|visual| visual.tab.id == id) else {
@@ -1008,9 +1019,7 @@ impl NativeUi {
 
     unsafe fn destroy_resources(&mut self) {
         unsafe {
-            if self.animation_running {
-                KillTimer(self.window, ANIMATION_TIMER);
-            }
+            self.frame_clock.stop();
             if !self.mouse_hook.is_null() {
                 UnhookWindowsHookEx(self.mouse_hook);
                 self.mouse_hook = ptr::null_mut();
@@ -1223,6 +1232,29 @@ pub(crate) fn apply_browser_visibility(
                 },
             );
         }
+    }
+}
+
+pub(crate) const REVEAL_AFTER_LOAD_MS: u32 = 30;
+pub(crate) const REVEAL_FALLBACK_MS: u32 = 400;
+
+pub(crate) fn schedule_reveal(window: HWND, delay: u32) {
+    unsafe { SetTimer(window, REVEAL_TIMER, delay, None) };
+}
+
+pub(crate) fn stage_browser(window: HWND, browser: HWND) {
+    let (width, height) = unsafe { client_size(window) };
+    let top = content_top(window);
+    unsafe {
+        SetWindowPos(
+            browser,
+            HWND_BOTTOM,
+            0,
+            top,
+            width,
+            (height - top).max(0),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
 
@@ -1700,15 +1732,25 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
-            WM_TIMER if wparam == ANIMATION_TIMER => {
+            WM_ANIMATION_FRAME => {
                 if let Some(ui) = ui_mut(window) {
+                    ui.frame_clock.frame_handled();
                     ui.animate();
                 }
+                UpdateWindow(window);
                 return 0;
             }
             WM_TIMER if wparam == UPDATE_TIMER => {
                 if let Some(ui) = ui_mut(window) {
                     ui.refresh_update();
+                }
+                return 0;
+            }
+            WM_TIMER if wparam == REVEAL_TIMER => {
+                KillTimer(window, REVEAL_TIMER);
+                let controller = ui_mut(window).map(|ui| ui.controller.clone());
+                if let Some(controller) = controller {
+                    BrowserController::reveal_active_tab(&controller);
                 }
                 return 0;
             }
@@ -1816,6 +1858,13 @@ unsafe extern "system" fn window_proc(
                 let browser = wparam as HWND;
                 if !browser.is_null() {
                     DestroyWindow(browser);
+                }
+                return 0;
+            }
+            WM_COMMIT_CLOSE_TAB => {
+                let controller = ui_mut(window).map(|ui| ui.controller.clone());
+                if let Some(controller) = controller {
+                    BrowserController::close_tab(&controller, wparam as u64);
                 }
                 return 0;
             }
@@ -2568,16 +2617,16 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
         draw_caption_close(ui, memory, width);
         if !tabs_only {
             draw_bookmarks(ui, memory);
+            let divider = RECT {
+                left: 0,
+                top: toolbar_height - 1,
+                right: width,
+                bottom: toolbar_height,
+            };
+            let brush = CreateSolidBrush(ui.palette.divider);
+            FillRect(memory, &divider, brush);
+            DeleteObject(brush as HGDIOBJ);
         }
-        let divider = RECT {
-            left: 0,
-            top: toolbar_height - 1,
-            right: width,
-            bottom: toolbar_height,
-        };
-        let brush = CreateSolidBrush(ui.palette.divider);
-        FillRect(memory, &divider, brush);
-        DeleteObject(brush as HGDIOBJ);
         BitBlt(dc, 0, 0, width, toolbar_height, memory, 0, 0, SRCCOPY);
         SelectObject(memory, old_bitmap);
         DeleteObject(bitmap as HGDIOBJ);
@@ -3531,6 +3580,43 @@ unsafe fn create_font(height: i32, family: &str) -> HFONT {
             (DEFAULT_PITCH | FF_DONTCARE).into(),
             wide(family).as_ptr(),
         )
+    }
+}
+
+#[derive(Default)]
+struct FrameClock {
+    generation: AtomicU64,
+    pending: AtomicBool,
+}
+
+impl FrameClock {
+    fn start(self: &Arc<Self>, window: HWND, fallback_interval: u32) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.pending.store(false, Ordering::SeqCst);
+        let clock = Arc::clone(self);
+        let window = window as usize;
+        let fallback = Duration::from_millis(fallback_interval.into());
+        thread::spawn(move || {
+            while clock.generation.load(Ordering::SeqCst) == generation {
+                if unsafe { DwmFlush() } < 0 {
+                    thread::sleep(fallback);
+                }
+                if clock.generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
+                if !clock.pending.swap(true, Ordering::SeqCst) {
+                    unsafe { PostMessageW(window as HWND, WM_ANIMATION_FRAME, 0, 0) };
+                }
+            }
+        });
+    }
+
+    fn stop(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn frame_handled(&self) {
+        self.pending.store(false, Ordering::SeqCst);
     }
 }
 

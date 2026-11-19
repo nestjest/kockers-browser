@@ -68,11 +68,6 @@ fn start_page_html() -> String {
     let muted = if dark { "#a2a89c" } else { "#8b8d83" };
     let line = if dark { "#3c4239" } else { "#dedfd7" };
     let hover = if dark { "#32372f" } else { "#e7e9e0" };
-    let animation = if preferences.reduce_animations {
-        "none"
-    } else {
-        "page-in .12s linear both"
-    };
     let placeholder = if english {
         "Address or search"
     } else {
@@ -86,15 +81,14 @@ fn start_page_html() -> String {
 body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 32px; overflow: hidden;
   background: radial-gradient(circle at 50% 35%, {surface} 0, {background} 62%); color: {foreground}; font-family: "Segoe UI", Arial, sans-serif; }}
 main {{ position: relative; top: -4vh; width: min(560px, 100%); text-align: center; }}
-.brand {{ animation: {animation}; }} .logo {{ width: 104px; height: 104px; margin: 0 auto 22px; filter: drop-shadow(0 12px 24px #25281a18); }} .logo svg {{ display: block; width: 100%; height: 100%; }}
+.logo {{ width: 104px; height: 104px; margin: 0 auto 22px; filter: drop-shadow(0 12px 24px #25281a18); }} .logo svg {{ display: block; width: 100%; height: 100%; }}
 h1 {{ margin: 0 0 34px; font-size: 20px; font-weight: 600; letter-spacing: .32em; text-indent: .32em; }}
-form {{ margin: 0; animation: {animation}; }}
+form {{ margin: 0; }}
 input {{ width: 100%; height: 54px; border: 1px solid {line}; border-radius: 27px; outline: none; padding: 0 24px; background: {surface}; color: {foreground}; box-shadow: 0 8px 30px #25281a0c; font: 15px "Segoe UI", Arial, sans-serif; transition: border-color .12s linear; }}
 input:focus {{ border-color: #9da36f; box-shadow: 0 10px 34px #25281a14; }} input::placeholder {{ color: {muted}; }}
-.update {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 12px 16px; border: 1px solid {line}; border-radius: 14px; background: {surface}; color: {muted}; font-size: 13px; text-align: left; animation: {animation}; }}
+.update {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 12px 16px; border: 1px solid {line}; border-radius: 14px; background: {surface}; color: {muted}; font-size: 13px; text-align: left; }}
 .update a {{ flex: none; border-radius: 8px; padding: 7px 10px; color: {foreground}; font-weight: 600; text-decoration: none; }} .update a:hover {{ background: {hover}; }}
-@keyframes page-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
-@media (prefers-reduced-motion: reduce) {{ .brand, form, .update {{ animation: none; }} input {{ transition: none; }} }}
+@media (prefers-reduced-motion: reduce) {{ input {{ transition: none; }} }}
 </style></head><body><main><div class="brand"><div class="logo">{logo_svg}</div><h1>KOCKERS</h1></div>
 <form id="navigation"><input id="address" type="text" autofocus autocomplete="off" spellcheck="false" aria-label="{placeholder}" placeholder="{placeholder}"></form>{update_notice}</main>
 <script>
