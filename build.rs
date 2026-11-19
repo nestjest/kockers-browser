@@ -5,9 +5,9 @@ fn main() {
         .set_icon_with_id("assets/tab.ico", "2")
         .set_icon_with_id("assets/tab-light.ico", "3")
         .set("FileDescription", "Kockers Browser")
-        .set("FileVersion", "0.2.4.3")
+        .set("FileVersion", "0.2.4.4")
         .set("ProductName", "KOCKERS SOCIETY")
-        .set("ProductVersion", "0.2.4.3")
+        .set("ProductVersion", "0.2.4.4")
         .compile()
     {
         panic!("failed to embed Windows resources: {error}");
