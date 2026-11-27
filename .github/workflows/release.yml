@@ -1,0 +1,172 @@
+name: Release Windows Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза (например v0.2.5.1; по умолчанию берётся из installer/KockersBrowser.iss)"
+        required: false
+        default: ""
+      notes:
+        description: "Патчноут релиза (если пусто — автогенерация из коммитов)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Отметить как Pre-release"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build & Publish (Windows x64)
+    runs-on: windows-latest
+    shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust stable + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache CEF binary distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/CEF
+          key: cef-win-x64-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cef-win-x64-
+
+      - name: Cache Cargo & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ensure Inno Setup 6 is installed
+        run: |
+          $found = @(
+            (Get-Command "ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+
+          if (-not $found) {
+            Write-Host "Inno Setup 6 not found, installing via Chocolatey..."
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Found Inno Setup 6: $found"
+          }
+
+      - name: Resolve and validate release version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          $iss = Get-Content "installer/KockersBrowser.iss" -Raw
+          if ($iss -notmatch '#define AppVersion "([^"]+)"') {
+            throw "Could not parse AppVersion from installer/KockersBrowser.iss"
+          }
+          $issVersion = $Matches[1]
+
+          $lib = Get-Content "src/lib.rs" -Raw
+          if ($lib -notmatch 'pub const APP_VERSION: &str = "([^"]+)"') {
+            throw "Could not parse APP_VERSION from src/lib.rs"
+          }
+          $libVersion = $Matches[1]
+
+          if ($issVersion -ne $libVersion) {
+            throw "Version mismatch: installer/KockersBrowser.iss ($issVersion) != src/lib.rs ($libVersion)"
+          }
+
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_TAG)) {
+            $tag = $env:INPUT_TAG.Trim()
+          } else {
+            $tag = "v$issVersion"
+          }
+
+          $tagVersion = $tag -replace '^v', ''
+          if ($tagVersion -ne $issVersion) {
+            throw "Tag version ($tagVersion) does not match AppVersion ($issVersion). Update Cargo.toml, src/lib.rs, build.rs and installer/KockersBrowser.iss before tagging."
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$issVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release tag: $tag (version $issVersion)"
+
+      - name: Run unit tests and clippy
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/cargo.ps1 test --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          powershell -ExecutionPolicy Bypass -Command '& "./scripts/cargo.ps1" -CargoArgs @("clippy","--all-targets","--","-D","warnings")'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build release installer & SHA256SUMS.txt
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/installer.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist/ | Format-Table Name, Length -AutoSize
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KockersBrowser-${{ steps.meta.outputs.version }}-windows-x64
+          path: |
+            dist/KockersBrowser-${{ steps.meta.outputs.version }}-windows-x64-setup.exe
+            dist/SHA256SUMS.txt
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          INPUT_NOTES: ${{ inputs.notes }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $setup = "dist/KockersBrowser-$env:VERSION-windows-x64-setup.exe"
+          $sums = "dist/SHA256SUMS.txt"
+
+          $prevPref = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          gh release view $env:TAG *> $null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = $prevPref
+
+          if ($releaseExists) {
+            Write-Host "Release $env:TAG already exists — uploading/replacing assets..."
+            gh release upload $env:TAG $setup $sums --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Creating new release $env:TAG..."
+            $ghArgs = @("release", "create", $env:TAG, $setup, $sums, "--title", "Kockers Browser $env:VERSION")
+            if (-not [string]::IsNullOrWhiteSpace($env:INPUT_NOTES)) {
+              $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
+              Set-Content -Path $notesFile -Value $env:INPUT_NOTES -Encoding utf8
+              $ghArgs += @("--notes-file", $notesFile)
+            } else {
+              $ghArgs += "--generate-notes"
+            }
+            if ($env:IS_PRERELEASE -eq "true") {
+              $ghArgs += "--prerelease"
+            }
+            & gh @ghArgs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
