@@ -85,7 +85,9 @@ pub fn run(main_args: &MainArgs, command_line: &CommandLine, sandbox_info: *mut 
         update::start();
     }
     run_message_loop();
+    platform::clear_image_cache();
     shutdown();
+    crate::extensions::restart_if_requested();
     0
 }
 
@@ -95,6 +97,18 @@ wrap_app! {
     }
 
     impl App {
+        fn on_before_command_line_processing(
+            &self,
+            process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            if process_type.is_none()
+                && let Some(command_line) = command_line
+            {
+                crate::extensions::configure_command_line(command_line);
+            }
+        }
+
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
             Some(KockersBrowserProcessHandler::new(
                 RefCell::new(None),
@@ -111,6 +125,10 @@ wrap_browser_process_handler! {
     }
 
     impl BrowserProcessHandler {
+        fn default_client(&self) -> Option<Client> {
+            self.client.borrow().as_ref().cloned()
+        }
+
         fn on_already_running_app_relaunch(
             &self,
             _command_line: Option<&mut CommandLine>,
@@ -135,6 +153,19 @@ wrap_browser_process_handler! {
 
         fn on_context_initialized(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
+
+            if let Some(context) = request_context_get_global_context() {
+                for name in ["download_bubble_enabled", "download_bubble.partial_view_enabled"] {
+                    let Some(mut value) = value_create() else { continue };
+                    value.set_bool(0);
+                    let mut error = CefString::default();
+                    context.set_preference(
+                        Some(&CefString::from(name)),
+                        Some(&mut value),
+                        Some(&mut error),
+                    );
+                }
+            }
 
             let client = browser::KockersClient::new(self.controller.clone());
             *self.client.borrow_mut() = Some(client);

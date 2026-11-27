@@ -1,7 +1,10 @@
 use std::{
+    collections::VecDeque,
     fs, iter,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -11,6 +14,109 @@ use windows_sys::Win32::Storage::FileSystem::{
 const MAX_HISTORY: usize = 2_000;
 const MAX_CLOSED_TABS: usize = 20;
 const MAX_BOOKMARKS: usize = 200;
+const MAX_PENDING_HISTORY: usize = 256;
+
+#[derive(Default)]
+struct WriteQueue {
+    pending_session: Option<Session>,
+    pending_history: VecDeque<(String, String)>,
+    writing: bool,
+}
+
+struct AsyncWriter {
+    queue: Mutex<WriteQueue>,
+    wake: Condvar,
+    idle: Condvar,
+}
+
+static ASYNC_WRITER: OnceLock<Option<Arc<AsyncWriter>>> = OnceLock::new();
+
+fn lock_queue(queue: &Mutex<WriteQueue>) -> MutexGuard<'_, WriteQueue> {
+    queue.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+fn async_writer() -> Option<&'static Arc<AsyncWriter>> {
+    ASYNC_WRITER
+        .get_or_init(|| {
+            let writer = Arc::new(AsyncWriter {
+                queue: Mutex::new(WriteQueue::default()),
+                wake: Condvar::new(),
+                idle: Condvar::new(),
+            });
+            let worker = Arc::clone(&writer);
+            thread::Builder::new()
+                .name("storage-writer".to_owned())
+                .spawn(move || {
+                    loop {
+                        let (session, history_batch) = {
+                            let mut queue = lock_queue(&worker.queue);
+                            while queue.pending_session.is_none()
+                                && queue.pending_history.is_empty()
+                            {
+                                queue.writing = false;
+                                worker.idle.notify_all();
+                                queue = worker
+                                    .wake
+                                    .wait(queue)
+                                    .unwrap_or_else(|error| error.into_inner());
+                            }
+                            queue.writing = true;
+                            let session = queue.pending_session.take();
+                            let history = queue.pending_history.drain(..).collect::<Vec<_>>();
+                            (session, history)
+                        };
+                        if let Some(session) = session {
+                            save_session(&session);
+                        }
+                        if !history_batch.is_empty() {
+                            add_history_batch(&history_batch);
+                        }
+                    }
+                })
+                .ok()?;
+            Some(writer)
+        })
+        .as_ref()
+}
+
+pub fn save_session_async(session: Session) {
+    if let Some(writer) = async_writer() {
+        let mut queue = lock_queue(&writer.queue);
+        queue.pending_session = Some(session);
+        writer.wake.notify_one();
+    } else {
+        save_session(&session);
+    }
+}
+
+pub fn add_history_async(url: String, title: String) {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return;
+    }
+    if let Some(writer) = async_writer() {
+        let mut queue = lock_queue(&writer.queue);
+        if queue.pending_history.len() >= MAX_PENDING_HISTORY {
+            queue.pending_history.pop_front();
+        }
+        queue.pending_history.push_back((url, title));
+        writer.wake.notify_one();
+    } else {
+        add_history(&url, &title);
+    }
+}
+
+pub fn flush_async_writes() {
+    let Some(Some(writer)) = ASYNC_WRITER.get() else {
+        return;
+    };
+    let mut queue = lock_queue(&writer.queue);
+    while queue.writing || queue.pending_session.is_some() || !queue.pending_history.is_empty() {
+        queue = writer
+            .idle
+            .wait(queue)
+            .unwrap_or_else(|error| error.into_inner());
+    }
+}
 
 macro_rules! text_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -498,7 +604,7 @@ pub fn add_history(url: &str, title: &str) {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return;
     }
-    let mut entries = load_history();
+    let mut entries = load_history_raw();
     entries.retain(|entry| entry.url != url);
     entries.push(HistoryEntry {
         url: url.to_owned(),
@@ -511,8 +617,33 @@ pub fn add_history(url: &str, title: &str) {
     save_history(&entries);
 }
 
+fn add_history_batch(batch: &[(String, String)]) {
+    let valid = batch
+        .iter()
+        .filter(|(url, _)| url.starts_with("https://") || url.starts_with("http://"))
+        .collect::<Vec<_>>();
+    if valid.is_empty() {
+        return;
+    }
+    let mut entries = load_history_raw();
+    let timestamp = now();
+    for (url, title) in valid {
+        entries.retain(|entry| entry.url != *url);
+        entries.push(HistoryEntry {
+            url: url.clone(),
+            title: title.clone(),
+            visited_at: timestamp,
+        });
+    }
+    if entries.len() > MAX_HISTORY {
+        entries.drain(..entries.len() - MAX_HISTORY);
+    }
+    save_history(&entries);
+}
+
 pub fn remove_history(url: &str) {
-    let entries = load_history()
+    flush_async_writes();
+    let entries = load_history_raw()
         .into_iter()
         .filter(|entry| entry.url != url)
         .collect::<Vec<_>>();
@@ -520,6 +651,7 @@ pub fn remove_history(url: &str) {
 }
 
 pub fn clear_history_since(seconds: Option<u64>) {
+    flush_async_writes();
     if seconds.is_none() {
         if let Some(path) = data_dir().map(|path| path.join("history.txt")) {
             let _ = fs::remove_file(path);
@@ -527,7 +659,7 @@ pub fn clear_history_since(seconds: Option<u64>) {
         return;
     }
     let cutoff = now().saturating_sub(seconds.unwrap_or(0));
-    let entries = load_history()
+    let entries = load_history_raw()
         .into_iter()
         .filter(|entry| entry.visited_at < cutoff)
         .collect::<Vec<_>>();
@@ -535,6 +667,11 @@ pub fn clear_history_since(seconds: Option<u64>) {
 }
 
 pub fn load_history() -> Vec<HistoryEntry> {
+    flush_async_writes();
+    load_history_raw()
+}
+
+fn load_history_raw() -> Vec<HistoryEntry> {
     let Some(path) = data_dir().map(|path| path.join("history.txt")) else {
         return Vec::new();
     };

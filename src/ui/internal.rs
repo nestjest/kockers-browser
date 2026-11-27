@@ -1,4 +1,4 @@
-use super::pages::{data_url, escape_html};
+use super::pages::{LOGO_LIGHT_SVG, LOGO_SVG, data_url, escape_html};
 use crate::storage::{self, Accent, Language, Preferences, Theme};
 use cef::{CefString, base64_encode};
 use std::{fs, path::Path};
@@ -25,12 +25,16 @@ pub enum InternalPage {
 }
 
 impl InternalPage {
+    #[allow(dead_code)]
     pub fn url(self) -> String {
-        let preferences = storage::load_preferences();
+        self.url_for(&storage::load_preferences())
+    }
+
+    pub fn url_for(self, preferences: &Preferences) -> String {
         let html = match self {
-            Self::Profile => profile_html(&preferences),
-            Self::Settings(section) => settings_html(section, &preferences),
-            Self::History => history_html(&preferences),
+            Self::Profile => profile_html(preferences),
+            Self::Settings(section) => settings_html(section, preferences),
+            Self::History => history_html(preferences),
         };
         data_url(&html)
     }
@@ -66,27 +70,28 @@ fn document(_language: Language, title: &str, body: &str, preferences: &Preferen
 :root{{color-scheme:{};--bg:{};--surface:{};--raised:{};--text:{};--muted:{};--line:{};--hover:{};--accent:{accent}}}
 *{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:radial-gradient(circle at 75% 0,var(--raised),var(--bg) 52%);color:var(--text);font:14px "Segoe UI",Arial,sans-serif}}
 a{{color:inherit}}button,input,textarea,select{{font:inherit}}button,select,input,textarea{{color:var(--text)}}button{{cursor:pointer}}
-.shell{{display:grid;grid-template-columns:230px minmax(0,850px);gap:32px;max-width:1160px;margin:auto;padding:34px 28px 64px}}
-.sidebar{{position:sticky;top:28px;align-self:start}}.brand{{display:flex;align-items:center;gap:10px;margin:0 8px 26px;font-size:17px;font-weight:600;letter-spacing:.12em}}
-.brand svg{{width:26px;height:26px}}.nav{{display:grid;gap:4px}}.nav a{{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:11px;text-decoration:none;color:var(--muted);transition:background .16s,color .16s}}
+.shell{{display:grid;grid-template-columns:240px minmax(0,840px);gap:32px;max-width:1160px;margin:auto;padding:32px 24px 64px}}
+.sidebar{{position:sticky;top:28px;align-self:start}}.brand{{display:flex;align-items:center;gap:12px;margin:0 8px 24px;font-size:17px;font-weight:600;letter-spacing:.12em}}
+.brand svg{{width:24px;height:24px;flex:none}}.nav{{display:grid;gap:4px}}.nav a{{display:flex;align-items:center;min-height:44px;gap:12px;padding:10px 16px;border-radius:9999px;text-decoration:none;color:var(--muted);transition:background .16s,color .16s}}
 .nav a:hover{{background:var(--hover);color:var(--text)}}.nav a.active{{background:color-mix(in srgb,var(--accent) 22%,var(--hover));color:var(--text)}}.nav svg,.icon{{width:18px;height:18px;fill:currentColor;stroke:none;flex:none}}
-main{{min-width:0;animation:{motion}}}.heading{{margin:4px 0 24px}}h1{{font-size:27px;font-weight:600;letter-spacing:-.025em;margin:0 0 7px}}h2{{font-size:16px;font-weight:600;margin:0}}p{{line-height:1.55}}.subtitle{{margin:0;color:var(--muted)}}
-.card{{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid var(--line);border-radius:18px;box-shadow:0 14px 45px #00000009;overflow:hidden;margin-bottom:18px}}
-.row{{display:flex;align-items:center;justify-content:space-between;gap:24px;min-height:62px;padding:14px 20px;border-bottom:1px solid var(--line)}}.row:last-child{{border:0}}.row.stacked{{align-items:stretch;flex-direction:column;gap:10px}}.label{{font-weight:500}}.hint{{display:block;color:var(--muted);font-size:12px;margin-top:4px;line-height:1.45}}
-select,input[type=text],input[type=url],textarea{{border:1px solid var(--line);background:var(--raised);border-radius:10px;padding:9px 11px;outline:none;min-width:180px}}textarea{{width:100%;resize:vertical;min-height:105px;line-height:1.5}}input:focus,textarea:focus,select:focus{{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 15%,transparent)}}
-.switch{{appearance:none;width:42px;height:24px;min-width:42px;border:0;border-radius:20px;background:var(--line);position:relative;cursor:pointer;transition:background .12s linear;flex:none}}.switch:before{{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 1px 4px #0003;transition:transform .12s linear}}.switch:checked{{background:var(--accent)}}.switch:checked:before{{transform:translateX(18px)}}
-.btn{{border:1px solid var(--line);background:var(--raised);border-radius:10px;padding:9px 14px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:background .12s linear}}.btn:hover{{background:var(--hover)}}.btn.primary{{background:var(--accent);border-color:var(--accent);color:white}}.btn.danger{{color:#b04d47}}.actions{{display:flex;gap:10px;flex-wrap:wrap}}.note{{padding:14px 18px;color:var(--muted);font-size:12px}}
-.profile-banner{{height:210px;background:linear-gradient(125deg,var(--accent),var(--raised));background-size:cover;background-position:center;border-radius:18px 18px 0 0}}.avatar{{width:112px;height:112px;border-radius:50%;margin:-58px 0 14px 24px;border:5px solid var(--surface);background:var(--hover) center/cover;display:grid;place-items:center;font-size:36px;font-weight:600}}.profile-body{{padding:0 24px 24px}}.profile-name{{font-size:23px;font-weight:600;margin:0 0 5px}}.profile-description{{white-space:pre-wrap;color:var(--muted);margin:0 0 20px}}.field{{display:grid;gap:7px;margin-bottom:14px}}.field span{{color:var(--muted);font-size:12px}}
-.history-tools{{display:flex;gap:10px;margin-bottom:18px}}.history-tools input{{flex:1}}.history-entry{{display:grid;grid-template-columns:105px minmax(0,1fr) 36px;align-items:center;gap:12px;padding:13px 18px;border-bottom:1px solid var(--line)}}.history-entry:last-child{{border:0}}.history-time{{color:var(--muted);font-size:12px}}.history-link{{text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.history-url{{display:block;color:var(--muted);font-size:11px;margin-top:3px;overflow:hidden;text-overflow:ellipsis}}.icon-button{{border:0;background:transparent;color:var(--muted);border-radius:8px;padding:8px}}.icon-button:hover{{background:var(--hover);color:var(--text)}}.empty{{text-align:center;color:var(--muted);padding:56px 20px}}
+main{{min-width:0;animation:{motion}}}.heading{{margin:4px 0 24px}}h1{{font-size:27px;font-weight:600;letter-spacing:-.025em;margin:0 0 8px}}h2{{font-size:16px;font-weight:600;margin:0}}p{{line-height:1.55}}.subtitle{{margin:0;color:var(--muted)}}
+.card{{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid var(--line);border-radius:16px;box-shadow:0 14px 45px #00000009;overflow:hidden;margin-bottom:16px}}
+.row{{display:flex;align-items:center;justify-content:space-between;gap:24px;min-height:64px;padding:16px 24px;border-bottom:1px solid var(--line)}}.row:last-child{{border:0}}.row.stacked{{align-items:stretch;flex-direction:column;gap:12px}}.label{{font-weight:500}}.hint{{display:block;color:var(--muted);font-size:12px;margin-top:4px;line-height:1.45}}
+select,input[type=text],input[type=url],textarea{{border:1px solid var(--line);background:var(--raised);border-radius:12px;padding:10px 12px;outline:none;min-width:180px}}textarea{{width:100%;resize:vertical;min-height:105px;line-height:1.5}}input:focus,textarea:focus,select:focus{{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 15%,transparent)}}
+.switch{{appearance:none;width:44px;height:24px;min-width:44px;border:0;border-radius:9999px;background:var(--line);position:relative;cursor:pointer;transition:background .12s linear;flex:none}}.switch:before{{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;border-radius:50%;background:white;box-shadow:0 1px 4px #0003;transition:transform .12s linear}}.switch:checked{{background:var(--accent)}}.switch:checked:before{{transform:translateX(20px)}}
+.btn{{border:1px solid var(--line);background:var(--raised);border-radius:9999px;min-height:40px;padding:8px 16px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;transition:background .12s linear}}.btn:hover{{background:var(--hover)}}.btn.primary{{background:var(--accent);border-color:var(--accent);color:white}}.btn.danger{{color:#b04d47}}.actions{{display:flex;gap:12px;flex-wrap:wrap}}.note{{padding:16px 20px;color:var(--muted);font-size:12px}}
+.profile-banner{{height:210px;background:linear-gradient(125deg,var(--accent),var(--raised));background-size:cover;background-position:center;border-radius:16px 16px 0 0}}.avatar{{width:112px;height:112px;border-radius:50%;margin:-56px 0 16px 24px;border:5px solid var(--surface);background:var(--hover) center/cover;display:grid;place-items:center;font-size:36px;font-weight:600}}.profile-body{{padding:0 24px 24px}}.profile-name{{font-size:23px;font-weight:600;margin:0 0 4px}}.profile-description{{white-space:pre-wrap;color:var(--muted);margin:0 0 20px}}.field{{display:grid;gap:8px;margin-bottom:16px}}.field span{{color:var(--muted);font-size:12px}}
+.history-tools{{display:flex;gap:12px;margin-bottom:16px}}.history-tools input{{flex:1}}.history-entry{{display:grid;grid-template-columns:112px minmax(0,1fr) 40px;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid var(--line)}}.history-entry:last-child{{border:0}}.history-time{{color:var(--muted);font-size:12px}}.history-link{{text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.history-url{{display:block;color:var(--muted);font-size:11px;margin-top:4px;overflow:hidden;text-overflow:ellipsis}}.icon-button{{width:36px;height:36px;display:grid;place-items:center;border:0;background:transparent;color:var(--muted);border-radius:9999px;padding:0}}.icon-button:hover{{background:var(--hover);color:var(--text)}}.empty{{text-align:center;color:var(--muted);padding:56px 24px}}
 @keyframes page-in{{from{{opacity:0}}to{{opacity:1}}}}
-@media(max-width:850px){{.shell{{grid-template-columns:1fr;padding:20px}}.sidebar{{position:static}}.nav{{grid-template-columns:repeat(2,minmax(0,1fr))}}.brand{{margin-bottom:14px}}}}
+@media(max-width:850px){{.shell{{grid-template-columns:1fr;padding:24px 16px}}.sidebar{{position:static}}.nav{{grid-template-columns:repeat(2,minmax(0,1fr))}}.brand{{margin-bottom:16px}}}}
 @media(prefers-reduced-motion:reduce){{main{{animation:none}}*{{transition:none!important}}}}
 </style></head><body>{}<script>
 function action(path,params={{}}){{const query=new URLSearchParams(params).toString();location.href='kockers-action:'+path+(query?'?'+query:'');}}
 function setting(key,value){{action('settings/set',{{key,value}});}}
 function saveProfile(event){{event.preventDefault();action('profile/save',{{nickname:document.getElementById('nickname').value,description:document.getElementById('description').value}});}}
 const historySearch=document.getElementById('history-search');if(historySearch){{historySearch.addEventListener('input',()=>{{const query=historySearch.value.toLowerCase();document.querySelectorAll('.history-entry').forEach(entry=>entry.hidden=!entry.dataset.search.includes(query));}});}}
-document.querySelectorAll('[data-time]').forEach(element=>{{const date=new Date(Number(element.dataset.time)*1000);element.textContent=date.toLocaleString({{}},{{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}});element.title=date.toLocaleString();}});
+document.querySelectorAll('[data-time]').forEach(element=>{{const date=new Date(Number(element.dataset.time)*1000);element.textContent=date.toLocaleString(undefined,{{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}});element.title=date.toLocaleString();}});
+requestAnimationFrame(()=>requestAnimationFrame(()=>console.log('__kockers_first_paint__')));
 </script></body></html>"#,
         preferences.language.as_str(),
         escape_html(title),
@@ -102,7 +107,7 @@ document.querySelectorAll('[data-time]').forEach(element=>{{const date=new Date(
     )
 }
 
-fn sidebar(language: Language, active: &str) -> String {
+fn sidebar(language: Language, active: &str, dark: bool) -> String {
     let entries = [
         (
             "profile",
@@ -194,9 +199,9 @@ fn sidebar(language: Language, active: &str) -> String {
         nav.push_str(&format!(r#"<a class="{}" href="kockers-action:open/{}"><svg class="icon" viewBox="0 0 24 24"><path d="{}"/></svg>{}</a>"#,
             if active == id { "active" } else { "" }, path, icon, tr(language, russian, english)));
     }
+    let logo = if dark { LOGO_LIGHT_SVG } else { LOGO_SVG };
     format!(
-        r#"<aside class="sidebar"><div class="brand">KOCKERS</div><nav class="nav">{}</nav></aside>"#,
-        nav
+        r#"<aside class="sidebar"><div class="brand">{logo}<span>KOCKERS</span></div><nav class="nav">{nav}</nav></aside>"#,
     )
 }
 
@@ -564,12 +569,20 @@ fn settings_html(section: Section, preferences: &Preferences) -> String {
                 "История, закладки, вкладки и фотографии профиля сохранятся.",
                 "History, bookmarks, tabs and profile photos are preserved.",
             ),
-            r#"<button class="btn danger" onclick="if(confirm('Сбросить настройки браузера?'))action('settings/reset')">Сбросить настройки</button>"#,
+            format!(
+                r#"<button class="btn danger" onclick="if(confirm('{}'))action('settings/reset')">{}</button>"#,
+                tr(
+                    language,
+                    "Сбросить настройки браузера?",
+                    "Reset browser settings?"
+                ),
+                tr(language, "Сбросить настройки", "Reset settings"),
+            ),
         ),
     };
     let body = format!(
         r#"<div class="shell">{}<main><header class="heading"><h1>{}</h1><p class="subtitle">{}</p></header><section class="card">{}</section></main></div>"#,
-        sidebar(language, id),
+        sidebar(language, id, preferences.theme == Theme::Dark),
         title,
         subtitle,
         content
@@ -609,7 +622,7 @@ fn profile_html(preferences: &Preferences) -> String {
         r#"<div class="shell">{}<main><header class="heading"><h1>{}</h1><p class="subtitle">{}</p></header>
 <section class="card"><div class="profile-banner" style="{}"></div><div class="avatar" style="{}">{}</div><div class="profile-body"><p class="profile-name">{}</p><p class="profile-description">{}</p><div class="actions">{} {}</div></div></section>
 <form class="card" onsubmit="saveProfile(event)"><div class="row stacked"><h2>{}</h2></div><div class="row stacked"><label class="field"><span>{}</span><input id="nickname" type="text" maxlength="60" value="{}" placeholder="{}"></label><label class="field"><span>{}</span><textarea id="description" maxlength="500" placeholder="{}">{}</textarea></label><div class="actions"><button class="btn primary" type="submit">{}</button></div></div></form></main></div>"#,
-        sidebar(language, "profile"),
+        sidebar(language, "profile", preferences.theme == Theme::Dark),
         tr(language, "Профиль", "Profile"),
         tr(
             language,
@@ -678,7 +691,7 @@ fn history_html(preferences: &Preferences) -> String {
     }
     let body = format!(
         r#"<div class="shell">{}<main><header class="heading"><h1>{}</h1><p class="subtitle">{}</p></header><div class="history-tools"><input id="history-search" type="text" placeholder="{}" autofocus><button class="btn danger" onclick="if(confirm('{}'))action('history/clear')">{}</button></div><section class="card">{}</section></main></div>"#,
-        sidebar(language, "history"),
+        sidebar(language, "history", preferences.theme == Theme::Dark),
         tr(language, "История браузера", "Browser history"),
         tr(
             language,
@@ -788,4 +801,29 @@ fn js_string(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\'', "\\'")
         .replace(['\r', '\n'], "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_pages_emit_first_paint_fix_locale_and_localize_reset() {
+        let mut prefs = Preferences {
+            language: Language::English,
+            theme: Theme::Dark,
+            ..Preferences::default()
+        };
+        let reset = settings_html(Section::Reset, &prefs);
+        assert!(reset.contains("__kockers_first_paint__"));
+        assert!(reset.contains("date.toLocaleString(undefined"));
+        assert!(!reset.contains("date.toLocaleString({}"));
+        assert!(reset.contains("Reset browser settings?"));
+        assert!(reset.contains("Reset settings"));
+        assert!(reset.contains("<svg"));
+
+        prefs.language = Language::Russian;
+        let reset_ru = settings_html(Section::Reset, &prefs);
+        assert!(reset_ru.contains("Сбросить настройки браузера?"));
+    }
 }

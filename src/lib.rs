@@ -1,9 +1,13 @@
-pub const APP_VERSION: &str = "0.2.4.4";
+pub const APP_VERSION: &str = "0.2.5.0";
 
 #[cfg(target_os = "windows")]
 mod app;
 #[cfg(target_os = "windows")]
 mod browser;
+#[cfg(target_os = "windows")]
+mod extensions;
+#[cfg(target_os = "windows")]
+mod favicons;
 #[cfg(target_os = "windows")]
 mod navigation;
 #[cfg(target_os = "windows")]

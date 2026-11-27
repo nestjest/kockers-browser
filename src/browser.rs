@@ -1,10 +1,12 @@
 use crate::{
+    extensions::{self, ExtensionInfo},
+    favicons::FaviconCache,
     navigation, platform, storage,
     ui::{self, pages},
 };
 use cef::*;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     ptr,
     sync::{Arc, Mutex, MutexGuard},
@@ -13,11 +15,12 @@ use windows_sys::Win32::{
     Foundation::HWND,
     UI::{
         Input::KeyboardAndMouse::{VK_ESCAPE, VK_F5, VK_F11, VK_F12, VK_LEFT, VK_RIGHT, VK_TAB},
-        WindowsAndMessaging::WS_VISIBLE,
+        WindowsAndMessaging::{GA_ROOT, GetAncestor, IsWindowVisible, WS_VISIBLE},
     },
 };
 
 pub type SharedController = Arc<Mutex<BrowserController>>;
+const FIRST_PAINT_MESSAGE: &str = "__kockers_first_paint__";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct TabSnapshot {
@@ -26,6 +29,8 @@ pub struct TabSnapshot {
     pub pinned: bool,
     pub active: bool,
     pub loading: bool,
+    pub internal: bool,
+    pub favicon: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +76,7 @@ struct ClosedTab {
 struct Download {
     snapshot: DownloadSnapshot,
     callback: Option<DownloadItemCallback>,
+    extension_install_handled: bool,
 }
 
 pub struct BrowserController {
@@ -80,13 +86,24 @@ pub struct BrowserController {
     pending: VecDeque<u64>,
     closed: Vec<ClosedTab>,
     downloads: Vec<Download>,
+    extensions: Vec<ExtensionInfo>,
     next_tab_id: u64,
     private: bool,
     request_context: Option<RequestContext>,
     preferences: storage::Preferences,
     bookmarks: Vec<storage::Bookmark>,
+    favicons: FaviconCache,
     closing_window: bool,
     close_after_reveal: Vec<u64>,
+    last_saved_session: Option<storage::Session>,
+    orphan_browsers: HashSet<i32>,
+    orphan_browsers_to_close: Vec<Browser>,
+}
+
+struct AddressChangeUpdate {
+    window: HWND,
+    active: bool,
+    history: Option<(String, String)>,
 }
 
 enum CloseStep {
@@ -104,13 +121,18 @@ impl Default for BrowserController {
             pending: VecDeque::new(),
             closed: Vec::new(),
             downloads: Vec::new(),
+            extensions: Vec::new(),
             next_tab_id: 1,
             private: false,
             request_context: None,
             preferences: storage::load_preferences(),
             bookmarks: storage::load_bookmarks(),
+            favicons: FaviconCache::new(),
             closing_window: false,
             close_after_reveal: Vec::new(),
+            last_saved_session: None,
+            orphan_browsers: HashSet::new(),
+            orphan_browsers_to_close: Vec::new(),
         }
     }
 }
@@ -156,6 +178,8 @@ impl BrowserController {
                 pinned: tab.pinned,
                 active: self.active == Some(tab.id),
                 loading: tab.is_loading,
+                internal: pages::is_internal_page_url(&tab.url),
+                favicon: self.favicons.cached(&tab.url),
             })
             .collect()
     }
@@ -197,6 +221,26 @@ impl BrowserController {
         self.bookmarks.clone()
     }
 
+    pub fn favicon(&self, page_url: &str) -> Option<PathBuf> {
+        self.favicons.cached(page_url)
+    }
+
+    pub fn request_favicon(&self, page_url: &str, candidates: &[String]) -> bool {
+        self.favicons.request(page_url, candidates)
+    }
+
+    pub fn has_pending_favicons(&self) -> bool {
+        self.tabs
+            .iter()
+            .map(|tab| tab.url.as_str())
+            .chain(self.bookmarks.iter().map(|bookmark| bookmark.url.as_str()))
+            .any(|url| self.favicons.is_pending(url))
+    }
+
+    pub fn extensions_snapshot(&self) -> Vec<ExtensionInfo> {
+        self.extensions.clone()
+    }
+
     pub fn active_is_bookmarked(&self) -> bool {
         self.active_tab().is_some_and(|tab| {
             self.bookmarks
@@ -211,18 +255,33 @@ impl BrowserController {
             .unwrap_or_default()
     }
 
-    pub fn resize_content(&self) {
-        let browsers = self
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                tab.browser.as_ref().and_then(Browser::host).map(|host| {
-                    let handle = host.window_handle().0.cast::<std::ffi::c_void>();
-                    (tab.id, handle)
+    pub fn start_page_url(&self) -> String {
+        pages::start_page_url_for(&self.preferences)
+    }
+
+    pub fn resize_content(controller: &SharedController) {
+        let (window, active, browsers) = {
+            let state = lock_controller(controller);
+            let browsers = state
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    tab.browser.as_ref().and_then(Browser::host).map(|host| {
+                        let handle = host.window_handle().0.cast::<std::ffi::c_void>();
+                        (tab.id, handle)
+                    })
                 })
+                .filter(|(_, handle)| !handle.is_null())
+                .collect::<Vec<_>>();
+            (state.window, state.active, browsers)
+        };
+        let visible = browsers
+            .into_iter()
+            .filter(|(id, handle)| {
+                active == Some(*id) || unsafe { IsWindowVisible(*handle) != 0 }
             })
             .collect::<Vec<_>>();
-        unsafe { platform::resize_browsers(self.window, &browsers, self.active) };
+        unsafe { platform::resize_browsers(window, &visible, active) };
     }
 
     pub fn is_empty(&self) -> bool {
@@ -230,11 +289,13 @@ impl BrowserController {
     }
 
     pub fn navigate_input(controller: &SharedController, input: &str) {
-        let engine = lock_controller(controller).preferences.search_engine;
-        let target = match navigation::normalize_input_with(input, engine) {
+        let preferences = lock_controller(controller).preferences();
+        let target = match navigation::normalize_input_with(input, preferences.search_engine) {
             Ok(Some(url)) => url,
-            Ok(None) => pages::start_page_url(),
-            Err(error) => pages::error_page_url(input, &error.to_string(), None),
+            Ok(None) => pages::start_page_url_for(&preferences),
+            Err(error) => {
+                pages::error_page_url_for(input, &error.to_string(), None, &preferences)
+            }
         };
         Self::load_url(controller, &target);
     }
@@ -265,7 +326,7 @@ impl BrowserController {
         background: bool,
         position: Option<usize>,
     ) {
-        let (window, context, create) = {
+        let (window, context, create, dark_theme) = {
             let mut state = lock_controller(controller);
             if state.closing_window {
                 return;
@@ -310,40 +371,86 @@ impl BrowserController {
                 state.pending.push_back(id);
             }
             state.persist_session();
-            (state.window, state.request_context.clone(), create)
+            (
+                state.window,
+                state.request_context.clone(),
+                create,
+                state.preferences.theme == storage::Theme::Dark,
+            )
         };
         platform::refresh_tabs(window);
         if !background {
             platform::sync_active_tab(window);
         }
         if create {
-            create_browser(window, controller.clone(), url, context);
+            create_browser(window, controller.clone(), url, context, dark_theme);
         }
     }
 
     pub fn activate_tab(controller: &SharedController, id: u64) {
-        let create = {
+        enum ActivateAction {
+            Ready,
+            Stage(HWND),
+            Create {
+                url: String,
+                context: Option<RequestContext>,
+                dark_theme: bool,
+            },
+            Waiting,
+        }
+
+        let (window, action) = {
             let mut state = lock_controller(controller);
             if state.closing_window || state.tab(id).is_none() {
                 return;
             }
             state.active = Some(id);
-            let create = if state.tab(id).is_some_and(|tab| tab.browser.is_none()) {
-                let url = state.tab(id).map(|tab| tab.url.clone()).unwrap_or_default();
-                state.pending.push_back(id);
-                Some((url, state.request_context.clone()))
-            } else {
-                None
+            let tab_state = state.tab(id).map(|tab| {
+                let handle = tab
+                    .browser
+                    .as_ref()
+                    .and_then(Browser::host)
+                    .map(|host| host.window_handle().0.cast::<std::ffi::c_void>())
+                    .filter(|handle| !handle.is_null());
+                (tab.browser.is_some(), tab.ready, tab.url.clone(), handle)
+            });
+            let action = match tab_state {
+                Some((false, _, url, _)) => {
+                    if !state.pending.contains(&id) {
+                        state.pending.push_back(id);
+                        ActivateAction::Create {
+                            url,
+                            context: state.request_context.clone(),
+                            dark_theme: state.preferences.theme == storage::Theme::Dark,
+                        }
+                    } else {
+                        ActivateAction::Waiting
+                    }
+                }
+                Some((true, false, _, Some(handle))) => ActivateAction::Stage(handle),
+                Some((true, false, _, None)) => ActivateAction::Waiting,
+                _ => ActivateAction::Ready,
             };
             state.persist_session();
-            create
+            (state.window, action)
         };
-        let window = lock_controller(controller).window;
+        if matches!(action, ActivateAction::Ready | ActivateAction::Create { .. }) {
+            platform::cancel_reveal(window);
+        }
         apply_visibility(controller, window);
+        if let ActivateAction::Stage(handle) = action {
+            platform::stage_browser(window, handle);
+            platform::schedule_reveal(window, platform::REVEAL_FALLBACK_MS);
+        }
         platform::refresh_tabs(window);
         platform::sync_active_tab(window);
-        if let Some((url, context)) = create {
-            create_browser(window, controller.clone(), &url, context);
+        if let ActivateAction::Create {
+            url,
+            context,
+            dark_theme,
+        } = action
+        {
+            create_browser(window, controller.clone(), &url, context, dark_theme);
         }
     }
 
@@ -391,14 +498,15 @@ impl BrowserController {
             CloseStep::Close => {}
             CloseStep::Activate(next) => Self::activate_tab(controller, next),
             CloseStep::Replace => {
-                {
+                let start_url = {
                     let mut state = lock_controller(controller);
                     if let Some(tab) = state.tab_mut(id) {
                         tab.closing = true;
                     }
                     state.close_after_reveal.push(id);
-                }
-                Self::new_tab(controller, &pages::start_page_url(), false);
+                    state.start_page_url()
+                };
+                Self::new_tab(controller, &start_url, false);
                 return;
             }
         }
@@ -409,8 +517,9 @@ impl BrowserController {
             tab.browser.as_ref().and_then(Browser::host)
         };
         if let Some(host) = host {
-            host.close_browser(0);
-            if let Some(tab) = lock_controller(controller).tab_mut(id) {
+            if host.try_close_browser() == 0
+                && let Some(tab) = lock_controller(controller).tab_mut(id)
+            {
                 tab.closing = false;
             }
         } else {
@@ -440,6 +549,7 @@ impl BrowserController {
             }
             (state.window, closing)
         };
+        platform::cancel_reveal(window);
         apply_visibility(controller, window);
         for id in closing {
             Self::close_tab(controller, id);
@@ -457,7 +567,7 @@ impl BrowserController {
     }
 
     pub(crate) fn finish_tab_close(controller: &SharedController, id: u64) {
-        let (window, was_active, closing_window, empty) = {
+        let (window, was_active, closing_window, replacement_url) = {
             let mut state = lock_controller(controller);
             let Some(index) = state.tabs.iter().position(|tab| tab.id == id) else {
                 return;
@@ -484,19 +594,19 @@ impl BrowserController {
                     .map(|tab| tab.id);
             }
             state.persist_session();
+            let replacement_url = (state.tabs.is_empty() && !state.closing_window)
+                .then(|| state.start_page_url());
             (
                 state.window,
                 was_active,
                 state.closing_window,
-                state.tabs.is_empty(),
+                replacement_url,
             )
         };
-        if empty {
-            if !closing_window {
-                Self::new_tab(controller, &pages::start_page_url(), false);
-            }
-        } else {
-            let active = if was_active && !closing_window {
+        if let Some(url) = replacement_url {
+            Self::new_tab(controller, &url, false);
+        } else if !closing_window {
+            let active = if was_active {
                 lock_controller(controller).active
             } else {
                 None
@@ -647,7 +757,96 @@ impl BrowserController {
     }
 
     pub fn go_home(controller: &SharedController) {
-        Self::load_url(controller, &pages::start_page_url());
+        let url = lock_controller(controller).start_page_url();
+        Self::load_url(controller, &url);
+    }
+
+    pub fn close_orphan_browsers(controller: &SharedController) {
+        let browsers = {
+            let mut state = lock_controller(controller);
+            std::mem::take(&mut state.orphan_browsers_to_close)
+        };
+        for browser in browsers {
+            if let Some(host) = browser.host() {
+                host.close_browser(1);
+            }
+        }
+    }
+
+    pub fn handle_extension_installed(
+        controller: &SharedController,
+        window: HWND,
+        result: Result<String, String>,
+    ) {
+        match result {
+            Ok(id) => {
+                let installed = extensions::installed_extensions();
+                {
+                    let mut state = lock_controller(controller);
+                    state.extensions = installed;
+                }
+                platform::refresh_extensions(window);
+                if platform::confirm_extension_install(window, &id) {
+                    extensions::request_restart();
+                    platform::close_for_restart(window);
+                }
+            }
+            Err(error) => platform::show_fatal_error(&error),
+        }
+    }
+
+    pub fn open_extensions(controller: &SharedController) {
+        Self::new_tab(controller, "chrome://extensions", false);
+    }
+
+    pub fn toggle_extension_pin(controller: &SharedController, id: &str) {
+        let (pinned, window) = {
+            let state = lock_controller(controller);
+            let Some(extension) = state.extensions.iter().find(|extension| extension.id == id)
+            else {
+                return;
+            };
+            (!extension.pinned, state.window)
+        };
+        if let Err(error) = extensions::set_pinned(id, pinned) {
+            platform::show_fatal_error(&error);
+            return;
+        }
+        {
+            let mut state = lock_controller(controller);
+            if let Some(extension) = state
+                .extensions
+                .iter_mut()
+                .find(|extension| extension.id == id)
+            {
+                extension.pinned = pinned;
+            }
+        }
+        platform::refresh_extensions(window);
+    }
+
+    pub fn open_extension(controller: &SharedController, id: &str) {
+        let url = {
+            let state = lock_controller(controller);
+            if state.closing_window {
+                return;
+            }
+            state
+                .extensions
+                .iter()
+                .find(|extension| extension.id == id)
+                .and_then(|extension| {
+                    extension
+                        .options_url
+                        .clone()
+                        .or_else(|| extension.popup_url.clone())
+                })
+        };
+        if let Some(url) = url {
+            Self::new_tab(controller, &url, false);
+        } else {
+            Self::open_extensions(controller);
+        }
     }
 
     pub fn show_dev_tools(controller: &SharedController) {
@@ -673,22 +872,31 @@ impl BrowserController {
     }
 
     pub fn close_requested(controller: &SharedController) -> bool {
-        let hosts = {
+        let (hosts, orphans, session_to_save) = {
             let mut state = lock_controller(controller);
-            state.persist_session();
+            let session = (!state.private && !state.closing_window).then(|| state.build_session());
             state.closing_window = true;
+            state.orphan_browsers.clear();
+            let orphans = std::mem::take(&mut state.orphan_browsers_to_close);
             state.tabs.retain(|tab| tab.browser.is_some());
-            state
+            let hosts = state
                 .tabs
                 .iter_mut()
                 .filter_map(|tab| {
                     tab.closing = true;
                     tab.browser.as_ref().and_then(Browser::host)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (hosts, orphans, session)
         };
-        if hosts.is_empty() {
-            return true;
+        if let Some(session) = session_to_save {
+            storage::flush_async_writes();
+            storage::save_session(&session);
+        }
+        for orphan in orphans {
+            if let Some(host) = orphan.host() {
+                host.close_browser(1);
+            }
         }
         let mut accepted = true;
         for host in hosts {
@@ -796,7 +1004,8 @@ impl BrowserController {
     }
 
     pub fn open_internal_page(controller: &SharedController, page: ui::internal::InternalPage) {
-        Self::load_url(controller, &page.url());
+        let preferences = lock_controller(controller).preferences();
+        Self::load_url(controller, &page.url_for(&preferences));
     }
 
     pub fn handle_internal_action(controller: &SharedController, action: &str) {
@@ -1065,7 +1274,16 @@ impl BrowserController {
         if let Some(download) = download
             && download.status == DownloadStatus::Complete
         {
-            platform::open_downloaded_file(&download.path);
+            if download
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("crx"))
+            {
+                Self::open_extensions(controller);
+            } else {
+                platform::open_downloaded_file(&download.path);
+            }
         }
     }
 
@@ -1096,7 +1314,7 @@ impl BrowserController {
         browser_id: i32,
         frame: Option<&mut Frame>,
         url: &str,
-    ) -> Option<(HWND, bool)> {
+    ) -> Option<AddressChangeUpdate> {
         if frame.is_none_or(|frame| frame.is_main() == 0) {
             return None;
         }
@@ -1106,11 +1324,14 @@ impl BrowserController {
                 .is_some_and(|browser| browser.identifier() == browser_id)
         })?;
         self.tabs[index].url = url.to_owned();
-        if !self.private && self.preferences.save_history {
-            storage::add_history(url, &self.tabs[index].title);
-        }
+        let history = (!self.private && self.preferences.save_history)
+            .then(|| (url.to_owned(), self.tabs[index].title.clone()));
         self.persist_session();
-        Some((self.window, self.active == Some(self.tabs[index].id)))
+        Some(AddressChangeUpdate {
+            window: self.window,
+            active: self.active == Some(self.tabs[index].id),
+            history,
+        })
     }
 
     fn on_title_change(&mut self, browser_id: i32, title: &str) -> Option<(HWND, bool)> {
@@ -1163,38 +1384,58 @@ impl BrowserController {
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }
 
-    fn browser_handles(&self) -> Vec<(u64, HWND)> {
+    fn browser_handles(&self) -> Vec<(u64, HWND, bool)> {
         self.tabs
             .iter()
-            .filter(|tab| tab.ready)
             .filter_map(|tab| {
-                tab.browser
-                    .as_ref()
-                    .and_then(Browser::host)
-                    .map(|host| (tab.id, host.window_handle().0.cast::<std::ffi::c_void>()))
+                tab.browser.as_ref().and_then(Browser::host).map(|host| {
+                    (
+                        tab.id,
+                        host.window_handle().0.cast::<std::ffi::c_void>(),
+                        tab.ready,
+                    )
+                })
             })
-            .filter(|(_, handle)| !handle.is_null())
+            .filter(|(_, handle, _)| !handle.is_null())
             .collect()
     }
 
-    fn persist_session(&self) {
-        if self.private || self.closing_window {
-            return;
-        }
-        let session = storage::Session {
-            tabs: self
-                .tabs
-                .iter()
-                .filter(|tab| !tab.closing && !tab.url.starts_with("data:"))
-                .map(|tab| storage::SessionTab {
+    fn build_session(&self) -> storage::Session {
+        let mut tabs = Vec::new();
+        let mut active = None;
+        for tab in &self.tabs {
+            if !tab.closing && !tab.url.starts_with("data:") {
+                if self.active == Some(tab.id) {
+                    active = Some(tabs.len());
+                }
+                tabs.push(storage::SessionTab {
                     url: tab.url.clone(),
                     title: tab.title.clone(),
                     pinned: tab.pinned,
-                })
-                .collect(),
-            active: self.active_index().unwrap_or(0),
+                });
+            }
+        }
+        let active = if tabs.is_empty() {
+            0
+        } else {
+            active
+                .or_else(|| self.last_saved_session.as_ref().map(|session| session.active))
+                .unwrap_or(0)
+                .min(tabs.len() - 1)
         };
-        storage::save_session(&session);
+        storage::Session { tabs, active }
+    }
+
+    fn persist_session(&mut self) {
+        if self.private || self.closing_window {
+            return;
+        }
+        let session = self.build_session();
+        if self.last_saved_session.as_ref() == Some(&session) {
+            return;
+        }
+        self.last_saved_session = Some(session.clone());
+        storage::save_session_async(session);
     }
 }
 
@@ -1213,6 +1454,7 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
     {
         let mut state = lock_controller(&controller);
         state.set_window(window);
+        state.extensions = extensions::installed_extensions();
         if state.private && state.request_context.is_none() {
             drop(state);
             platform::show_fatal_error("Не удалось создать изолированный приватный контекст.");
@@ -1220,7 +1462,7 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
             return;
         }
     }
-    let (url, context, lazy_restore) = {
+    let (url, context, lazy_restore, dark_theme) = {
         let mut state = lock_controller(&controller);
         if !state.private && state.preferences.startup_mode == storage::StartupMode::Restore {
             let session = storage::load_session();
@@ -1243,6 +1485,7 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
                     });
                 }
                 state.active = state.tabs.get(session.active).map(|tab| tab.id);
+                state.last_saved_session = Some(state.build_session());
             }
         }
         if state.tabs.is_empty() {
@@ -1253,9 +1496,9 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
                 )
                 .ok()
                 .flatten()
-                .unwrap_or_else(pages::start_page_url)
+                .unwrap_or_else(|| state.start_page_url())
             } else {
-                pages::start_page_url()
+                state.start_page_url()
             };
             let id = state.next_tab_id;
             state.next_tab_id += 1;
@@ -1281,10 +1524,12 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
             tab.url.clone(),
             state.request_context.clone(),
             state.preferences.lazy_restore,
+            state.preferences.theme == storage::Theme::Dark,
         )
     };
+    platform::refresh_extensions(window);
     platform::refresh_tabs(window);
-    create_browser_with_client(window, &url, context.clone(), &mut client);
+    create_browser_with_client(window, &url, context.clone(), &mut client, dark_theme);
     if !lazy_restore {
         let restored = {
             let mut state = lock_controller(&controller);
@@ -1301,7 +1546,7 @@ pub fn create_main_browser(window: HWND, controller: SharedController, mut clien
             tabs
         };
         for (_, url) in restored {
-            create_browser(window, controller.clone(), &url, context.clone());
+            create_browser(window, controller.clone(), &url, context.clone(), dark_theme);
         }
     }
 }
@@ -1311,9 +1556,10 @@ fn create_browser(
     controller: SharedController,
     url: &str,
     context: Option<RequestContext>,
+    dark_theme: bool,
 ) {
     let mut client = KockersClient::new(controller);
-    create_browser_with_client(window, url, context, &mut client);
+    create_browser_with_client(window, url, context, &mut client, dark_theme);
 }
 
 fn create_browser_with_client(
@@ -1321,6 +1567,7 @@ fn create_browser_with_client(
     url: &str,
     mut context: Option<RequestContext>,
     client: &mut Client,
+    dark_theme: bool,
 ) {
     let (width, height) = unsafe { platform::client_size(window) };
     let content_top = platform::content_top(window);
@@ -1331,17 +1578,13 @@ fn create_browser_with_client(
         height: (height - content_top).max(0),
     };
     let mut window_info = WindowInfo {
-        runtime_style: RuntimeStyle::ALLOY,
+        runtime_style: RuntimeStyle::CHROME,
         ..Default::default()
     }
     .set_as_child(sys::HWND(window.cast()), &bounds);
     window_info.style &= !WS_VISIBLE;
     let settings = BrowserSettings {
-        background_color: if storage::load_preferences().theme == storage::Theme::Dark {
-            0xFF171917
-        } else {
-            0xFFF7F7F4
-        },
+        background_color: if dark_theme { 0xFF171917 } else { 0xFFF7F7F4 },
         ..Default::default()
     };
     let created = browser_host_create_browser(
@@ -1377,6 +1620,8 @@ fn update_download(
     let id = item.id();
     let full_path = CefString::from(&item.full_path()).to_string();
     let suggested = CefString::from(&item.suggested_file_name()).to_string();
+    let source_url = CefString::from(&item.url()).to_string();
+    let original_url = CefString::from(&item.original_url()).to_string();
     let path = PathBuf::from(&full_path);
     let name = path
         .file_name()
@@ -1394,18 +1639,22 @@ fn update_download(
     } else {
         DownloadStatus::InProgress
     };
+    let web_store_crx = status == DownloadStatus::Complete
+        && (crate::extensions::is_web_store_download(&source_url, &name)
+            || crate::extensions::is_web_store_download(&original_url, &name));
     let callback = callback.cloned();
-    let window = {
+    let (window, install_crx) = {
         let mut state = lock_controller(controller);
         let snapshot = DownloadSnapshot {
             id,
             name,
-            path,
+            path: path.clone(),
             received: item.received_bytes(),
             total: item.total_bytes(),
             percent: item.percent_complete(),
             status,
         };
+        let mut install_crx = false;
         if let Some(download) = state
             .downloads
             .iter_mut()
@@ -1418,8 +1667,17 @@ fn update_download(
                 } else {
                     None
                 };
+            if web_store_crx && !download.extension_install_handled {
+                download.extension_install_handled = true;
+                install_crx = true;
+            }
         } else {
-            state.downloads.push(Download { snapshot, callback });
+            install_crx = web_store_crx;
+            state.downloads.push(Download {
+                snapshot,
+                callback,
+                extension_install_handled: install_crx,
+            });
         }
         if state.downloads.len() > 50 {
             let index = state.downloads.iter().position(|download| {
@@ -1430,9 +1688,19 @@ fn update_download(
                 state.downloads.remove(index);
             }
         }
-        state.window
+        (state.window, install_crx)
     };
     platform::update_downloads(window);
+    if install_crx {
+        let window_addr = window as usize;
+        std::thread::Builder::new()
+            .name("crx-install".to_owned())
+            .spawn(move || {
+                let result = crate::extensions::install_crx(&path, &suggested);
+                platform::post_extension_installed(window_addr as HWND, result);
+            })
+            .ok();
+    }
 }
 
 pub fn sanitize_download_name(value: &str) -> String {
@@ -1530,7 +1798,15 @@ wrap_display_handler! {
             if let Some(id) = browser_id(browser) {
                 let url = url.map(CefString::to_string).unwrap_or_default();
                 let update = lock_controller(&self.controller).on_address_change(id, frame, &url);
-                if let Some((window, active)) = update {
+                if let Some(AddressChangeUpdate {
+                    window,
+                    active,
+                    history,
+                }) = update
+                {
+                    if let Some((history_url, history_title)) = history {
+                        storage::add_history_async(history_url, history_title);
+                    }
                     if active {
                         platform::update_address(window, &url);
                     }
@@ -1562,6 +1838,56 @@ wrap_display_handler! {
                 }
             }
         }
+
+        fn on_console_message(
+            &self,
+            browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: i32,
+        ) -> i32 {
+            if message.map(CefString::to_string).as_deref() != Some(FIRST_PAINT_MESSAGE) {
+                return 0;
+            }
+            let reveal = browser_id(browser).is_some_and(|id| {
+                let state = lock_controller(&self.controller);
+                state.active_tab().is_some_and(|tab| {
+                    tab.browser
+                        .as_ref()
+                        .is_some_and(|browser| browser.identifier() == id)
+                })
+            });
+            if reveal {
+                BrowserController::reveal_active_tab(&self.controller);
+            }
+            1
+        }
+
+        fn on_favicon_urlchange(
+            &self,
+            browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            let Some(page_url) = browser
+                .and_then(|browser| browser.main_frame())
+                .map(|frame| CefString::from(&frame.url()).to_string())
+            else {
+                return;
+            };
+            let candidates = icon_urls
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let window = {
+                let state = lock_controller(&self.controller);
+                state.request_favicon(&page_url, &candidates);
+                state.window
+            };
+            platform::refresh_tabs(window);
+            platform::schedule_favicon_refresh(window);
+        }
     }
 }
 
@@ -1572,13 +1898,60 @@ wrap_life_span_handler! {
 
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let (window, closing_window) = {
+                let state = lock_controller(&self.controller);
+                (state.window, state.closing_window)
+            };
+            if window.is_null() || closing_window {
+                return;
+            }
             let handle = browser
                 .as_ref()
                 .and_then(|browser| browser.host())
-                .map(|host| host.window_handle().0.cast::<std::ffi::c_void>());
+                .map(|host| host.window_handle().0.cast::<std::ffi::c_void>())
+                .unwrap_or(ptr::null_mut());
+            let owned = !handle.is_null() && unsafe { GetAncestor(handle, GA_ROOT) } == window;
+            if !owned {
+                if handle.is_null() {
+                    return;
+                }
+                let url = browser
+                    .as_ref()
+                    .and_then(|browser| browser.main_frame())
+                    .map(|frame| CefString::from(&frame.url()).to_string())
+                    .unwrap_or_default();
+                if url.starts_with("https://")
+                    || url.starts_with("http://")
+                    || url.starts_with("chrome-extension://")
+                {
+                    BrowserController::new_tab(&self.controller, &url, false);
+                    if let Some(browser) = browser {
+                        let queued = {
+                            let mut state = lock_controller(&self.controller);
+                            if state.closing_window {
+                                false
+                            } else {
+                                state.orphan_browsers_to_close.push(browser.clone());
+                                true
+                            }
+                        };
+                        if queued {
+                            platform::post_close_orphans(window);
+                        }
+                    }
+                } else if (url.is_empty() || url == "about:blank")
+                    && let Some(id) = browser_id(browser)
+                {
+                    let mut state = lock_controller(&self.controller);
+                    if !state.closing_window {
+                        state.orphan_browsers.insert(id);
+                    }
+                }
+                return;
+            }
             let created = lock_controller(&self.controller).on_after_created(browser);
             if let Some((window, _, active)) = created {
-                if active && let Some(handle) = handle.filter(|handle| !handle.is_null()) {
+                if active && !handle.is_null() {
                     platform::stage_browser(window, handle);
                     platform::schedule_reveal(window, platform::REVEAL_FALLBACK_MS);
                 }
@@ -1587,17 +1960,31 @@ wrap_life_span_handler! {
         }
 
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
-            let (window, closing_window) = {
+            let bid = browser.as_ref().map(|browser| browser.identifier());
+            let handle = browser
+                .as_ref()
+                .and_then(|browser| browser.host())
+                .map(|host| host.window_handle().0.cast::<std::ffi::c_void>())
+                .unwrap_or(ptr::null_mut());
+            let (window, closing_window, is_tracked) = {
                 let state = lock_controller(&self.controller);
-                (state.window, state.closing_window)
+                let tracked = bid.is_some_and(|id| {
+                    state.tabs.iter().any(|tab| {
+                        tab.browser
+                            .as_ref()
+                            .is_some_and(|current| current.identifier() == id)
+                    })
+                });
+                (state.window, state.closing_window, tracked)
             };
-            if closing_window {
+            let is_our_child = is_tracked
+                && !window.is_null()
+                && !handle.is_null()
+                && unsafe { GetAncestor(handle, GA_ROOT) } == window;
+            if closing_window || !is_our_child {
                 return 0;
             }
-            if let Some(host) = browser.and_then(|browser| browser.host()) {
-                let handle = host.window_handle().0.cast::<std::ffi::c_void>();
-                platform::post_browser_destroy(window, handle);
-            }
+            platform::post_browser_destroy(window, handle);
             1
         }
 
@@ -1609,7 +1996,7 @@ wrap_life_span_handler! {
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             _target_disposition: WindowOpenDisposition,
-            user_gesture: i32,
+            _user_gesture: i32,
             _popup_features: Option<&PopupFeatures>,
             _window_info: Option<&mut WindowInfo>,
             _client: Option<&mut Option<Client>>,
@@ -1617,28 +2004,33 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
-            if user_gesture != 0 {
-                let url = target_url.map(CefString::to_string).unwrap_or_default();
-                if ui::internal::is_action_url(&url) {
-                    let internal = lock_controller(&self.controller)
-                        .active_tab()
-                        .is_some_and(|tab| tab.url.starts_with("data:"));
-                    if internal {
-                        BrowserController::handle_internal_action(&self.controller, &url);
-                    }
-                } else if url.starts_with("https://") || url.starts_with("http://") {
-                    BrowserController::new_tab(&self.controller, &url, false);
+            let url = target_url.map(CefString::to_string).unwrap_or_default();
+            if ui::internal::is_action_url(&url) {
+                let internal = lock_controller(&self.controller)
+                    .active_tab()
+                    .is_some_and(|tab| tab.url.starts_with("data:"));
+                if internal {
+                    BrowserController::handle_internal_action(&self.controller, &url);
                 }
+            } else if url.starts_with("https://")
+                || url.starts_with("http://")
+                || url.starts_with("chrome-extension://")
+            {
+                BrowserController::new_tab(&self.controller, &url, false);
             }
             1
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
+            let browser_id = browser.map(|browser| browser.identifier());
             let (window, closing_window, id) = {
-                let state = lock_controller(&self.controller);
-                let id = browser.and_then(|browser| {
+                let mut state = lock_controller(&self.controller);
+                if let Some(browser_id) = browser_id {
+                    state.orphan_browsers.remove(&browser_id);
+                }
+                let id = browser_id.and_then(|browser_id| {
                     state.tabs.iter().find(|tab| {
-                        tab.browser.as_ref().is_some_and(|current| current.identifier() == browser.identifier())
+                        tab.browser.as_ref().is_some_and(|current| current.identifier() == browser_id)
                     }).map(|tab| tab.id)
                 });
                 (state.window, state.closing_window, id)
@@ -1684,26 +2076,35 @@ wrap_load_handler! {
             frame: Option<&mut Frame>,
             _http_status_code: i32,
         ) {
-            if frame.is_none_or(|frame| frame.is_main() == 0) {
+            let Some(frame) = frame else {
+                return;
+            };
+            if frame.is_main() == 0 {
                 return;
             }
+            let url = CefString::from(&frame.url()).to_string();
+            let is_internal = pages::is_internal_page_url(&url);
             if let Some(id) = browser_id(browser) {
-                let window = {
+                let should_reveal = {
                     let mut state = lock_controller(&self.controller);
-                    let window = state.window;
                     let active = state.active;
-                    let tab = state.tabs.iter_mut().find(|tab| {
+                    if let Some(tab) = state.tabs.iter_mut().find(|tab| {
                         tab.browser
                             .as_ref()
                             .is_some_and(|browser| browser.identifier() == id)
-                    });
-                    tab.and_then(|tab| {
-                        tab.ready = true;
-                        (active == Some(tab.id)).then_some(window)
-                    })
+                    }) {
+                        let is_active = active == Some(tab.id);
+                        let reveal = !tab.ready && is_active && !is_internal;
+                        if !is_internal || !is_active {
+                            tab.ready = true;
+                        }
+                        reveal
+                    } else {
+                        false
+                    }
                 };
-                if let Some(window) = window {
-                    platform::schedule_reveal(window, platform::REVEAL_AFTER_LOAD_MS);
+                if should_reveal {
+                    BrowserController::reveal_active_tab(&self.controller);
                 }
             }
         }
@@ -1726,19 +2127,29 @@ wrap_load_handler! {
             if frame.is_main() == 0 {
                 return;
             }
-            let known = lock_controller(&self.controller)
-                .tabs
-                .iter()
-                .any(|tab| tab.browser.as_ref().is_some_and(|current| current.identifier() == browser.identifier()));
-            if !known {
-                return;
-            }
+            let preferences = {
+                let state = lock_controller(&self.controller);
+                let known = state.tabs.iter().any(|tab| {
+                    tab.browser
+                        .as_ref()
+                        .is_some_and(|current| current.identifier() == browser.identifier())
+                });
+                if !known {
+                    return;
+                }
+                state.preferences()
+            };
             let failed_url = failed_url.map(CefString::to_string).unwrap_or_default();
             let error_text = error_text
                 .map(CefString::to_string)
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "Chromium не смог загрузить этот адрес.".to_owned());
-            let page = pages::error_page_url(&failed_url, &error_text, Some(raw_code as i32));
+            let page = pages::error_page_url_for(
+                &failed_url,
+                &error_text,
+                Some(raw_code as i32),
+                &preferences,
+            );
             frame.load_url(Some(&CefString::from(page.as_str())));
         }
     }
@@ -1806,7 +2217,7 @@ wrap_request_handler! {
     impl RequestHandler {
         fn on_before_browse(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             _user_gesture: i32,
@@ -1815,7 +2226,30 @@ wrap_request_handler! {
             if frame.is_none_or(|frame| frame.is_main() == 0) {
                 return 0;
             }
-            let url = request.map(|request| CefString::from(&request.url()).to_string()).unwrap_or_default();
+            let url = request
+                .map(|request| CefString::from(&request.url()).to_string())
+                .unwrap_or_default();
+            let orphan_window = browser.as_ref().and_then(|browser| {
+                let id = browser.identifier();
+                let mut state = lock_controller(&self.controller);
+                if !state.closing_window
+                    && state.orphan_browsers.contains(&id)
+                    && (url.starts_with("https://")
+                        || url.starts_with("http://")
+                        || url.starts_with("chrome-extension://"))
+                {
+                    state.orphan_browsers.remove(&id);
+                    state.orphan_browsers_to_close.push((*browser).clone());
+                    Some(state.window)
+                } else {
+                    None
+                }
+            });
+            if let Some(window) = orphan_window {
+                BrowserController::new_tab(&self.controller, &url, false);
+                platform::post_close_orphans(window);
+                return 1;
+            }
             if ui::internal::is_action_url(&url) {
                 let internal = lock_controller(&self.controller)
                     .active_tab()
@@ -1825,7 +2259,16 @@ wrap_request_handler! {
                 }
                 return 1;
             }
-            let allowed = ["http://", "https://", "data:", "about:", "blob:"]
+            let allowed = [
+                "http://",
+                "https://",
+                "data:",
+                "about:",
+                "blob:",
+                "devtools://",
+                "chrome://extensions",
+                "chrome-extension://",
+            ]
                 .iter()
                 .any(|scheme| url.starts_with(scheme));
             i32::from(!allowed)
@@ -1852,13 +2295,28 @@ wrap_request_handler! {
             if matches!(target_disposition, WindowOpenDisposition::NEW_FOREGROUND_TAB | WindowOpenDisposition::NEW_BACKGROUND_TAB | WindowOpenDisposition::NEW_POPUP | WindowOpenDisposition::NEW_WINDOW) {
                 if user_gesture != 0 {
                     let url = target_url.map(CefString::to_string).unwrap_or_default();
-                    if url.starts_with("https://") || url.starts_with("http://") {
+                    if url.starts_with("https://")
+                        || url.starts_with("http://")
+                        || url.starts_with("chrome-extension://")
+                    {
                         BrowserController::new_tab(&self.controller, &url, target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB);
                     }
                 }
                 return 1;
             }
-            0
+            let allowed = [
+                "http://",
+                "https://",
+                "data:",
+                "about:",
+                "blob:",
+                "devtools://",
+                "chrome://extensions",
+                "chrome-extension://",
+            ]
+                .iter()
+                .any(|scheme| url.starts_with(scheme));
+            i32::from(!allowed)
         }
     }
 }
@@ -1931,7 +2389,10 @@ wrap_keyboard_handler! {
                 key if key == 'H' as i32 && control => BrowserController::open_internal_page(&self.controller, ui::internal::InternalPage::History),
                 key if key == 'B' as i32 && control && shift => BrowserController::toggle_bookmarks_bar(&self.controller),
                 key if key == 'T' as i32 && control && shift => BrowserController::restore_closed_tab(&self.controller),
-                key if key == 'T' as i32 && control => BrowserController::new_tab(&self.controller, &pages::start_page_url(), false),
+                key if key == 'T' as i32 && control => {
+                    let url = lock_controller(&self.controller).start_page_url();
+                    BrowserController::new_tab(&self.controller, &url, false);
+                }
                 key if key == 'W' as i32 && control => BrowserController::close_active_tab(&self.controller),
                 key if key == 'N' as i32 && control && shift => BrowserController::open_private_window(),
                 key if key == VK_TAB as i32 && control => BrowserController::next_tab(&self.controller, shift),
@@ -1973,5 +2434,19 @@ mod tests {
         assert_eq!(sanitize_download_name("CON"), "_CON");
         assert_eq!(sanitize_download_name("con.txt"), "_con.txt");
         assert_eq!(sanitize_download_name(" \t"), "download");
+    }
+
+    #[test]
+    fn own_data_pages_are_marked_internal() {
+        let page_urls = [
+            pages::start_page_url(),
+            pages::error_page_url("https://example.com", "Ошибка", None),
+            ui::internal::InternalPage::Profile.url(),
+            ui::internal::InternalPage::Settings(ui::internal::Section::Appearance).url(),
+            ui::internal::InternalPage::History.url(),
+        ];
+        assert!(page_urls.iter().all(|url| pages::is_internal_page_url(url)));
+        assert!(!pages::is_internal_page_url("https://example.com"));
+        assert!(!pages::is_internal_page_url("data:image/png;base64,AAAA"));
     }
 }

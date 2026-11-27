@@ -3,11 +3,13 @@ use crate::browser::{
     lock_controller,
 };
 use crate::{
+    extensions::ExtensionInfo,
     storage,
     ui::{self, pages},
     update,
 };
 use std::{
+    collections::HashSet,
     ffi::c_void,
     iter, mem,
     path::{Path, PathBuf},
@@ -74,12 +76,16 @@ const TAB_ICON_ID: usize = 2;
 const TAB_LIGHT_ICON_ID: usize = 3;
 const UPDATE_TIMER: usize = 2;
 const REVEAL_TIMER: usize = 3;
+const FAVICON_TIMER: usize = 4;
 const WM_CLOSE_TAB: u32 = WM_APP + 1;
 const WM_FINALIZE_TAB: u32 = WM_APP + 2;
 const WM_DESTROY_TAB: u32 = WM_APP + 3;
 const WM_CLOSE_PANELS: u32 = WM_APP + 4;
 const WM_COMMIT_CLOSE_TAB: u32 = WM_APP + 5;
 const WM_ANIMATION_FRAME: u32 = WM_APP + 6;
+const WM_CLOSE_ORPHANS: u32 = WM_APP + 7;
+const WM_EXTENSION_INSTALLED: u32 = WM_APP + 8;
+const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWA_BORDER_COLOR: u32 = 34;
 const DWMWCP_DONOTROUND: u32 = 1;
@@ -117,7 +123,8 @@ enum Hit {
     Home,
     NewTab,
     Downloads,
-    Profile,
+    Extensions,
+    Extension(usize),
     Menu,
     Minimize,
     Maximize,
@@ -192,7 +199,24 @@ struct TabVisual {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PanelKind {
     Downloads,
+    Extensions,
     Menu,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtensionHit {
+    None,
+    Action(usize),
+    Pin(usize),
+    Manage,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadHit {
+    None,
+    Close,
+    Action(usize),
+    Cancel(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -252,6 +276,7 @@ struct NativeUi {
     title_font: HFONT,
     logo_icon: HICON,
     dark_theme: bool,
+    english: bool,
     current_url: String,
     address_editing: bool,
     is_loading: bool,
@@ -259,12 +284,19 @@ struct NativeUi {
     can_go_forward: bool,
     tabs: Vec<TabVisual>,
     downloads: Vec<DownloadSnapshot>,
+    seen_downloads: HashSet<u32>,
+    download_hover: DownloadHit,
+    previous_download_hover: DownloadHit,
+    download_hover_transition: Transition,
     bookmarks: Vec<storage::Bookmark>,
     bookmarked: bool,
     show_bookmarks: bool,
+    extensions: Vec<ExtensionInfo>,
+    extension_hover: ExtensionHit,
     panel: Option<PanelKind>,
     panel_open: bool,
     panel_visible: bool,
+    panel_alpha: Transition,
     menu_hover: usize,
     update_status: update::Status,
     update_timer_running: bool,
@@ -277,18 +309,20 @@ struct NativeUi {
     frame_clock: Arc<FrameClock>,
     rounded_by_dwm: bool,
     fullscreen: bool,
+    restore_maximized: bool,
     restore_rect: RECT,
     counted: bool,
 }
 
 impl NativeUi {
     fn new(controller: SharedController) -> Self {
-        let (bookmarks, bookmarked, preferences) = {
+        let (bookmarks, bookmarked, preferences, extensions) = {
             let state = lock_controller(&controller);
             (
                 state.bookmarks_snapshot(),
                 state.active_is_bookmarked(),
                 state.preferences(),
+                state.extensions_snapshot(),
             )
         };
         Self {
@@ -307,6 +341,7 @@ impl NativeUi {
             title_font: ptr::null_mut(),
             logo_icon: ptr::null_mut(),
             dark_theme: preferences.theme == storage::Theme::Dark,
+            english: preferences.language == storage::Language::English,
             current_url: String::new(),
             address_editing: false,
             is_loading: false,
@@ -314,11 +349,18 @@ impl NativeUi {
             can_go_forward: false,
             tabs: Vec::new(),
             downloads: Vec::new(),
+            seen_downloads: HashSet::new(),
+            download_hover: DownloadHit::None,
+            previous_download_hover: DownloadHit::None,
+            download_hover_transition: Transition::new(0.0),
             bookmarks,
             bookmarked,
+            extensions,
+            extension_hover: ExtensionHit::None,
             panel: None,
             panel_open: false,
             panel_visible: false,
+            panel_alpha: Transition::new(0.0),
             menu_hover: 0,
             update_status: update::snapshot(),
             update_timer_running: false,
@@ -331,6 +373,7 @@ impl NativeUi {
             frame_clock: Arc::default(),
             rounded_by_dwm: true,
             fullscreen: false,
+            restore_maximized: false,
             restore_rect: RECT::default(),
             counted: false,
         }
@@ -444,7 +487,7 @@ impl NativeUi {
     fn layout_tabs(&mut self) {
         let (width, _) = unsafe { client_size(self.window) };
         let origin = 64.0;
-        let available = (width as f32 - 248.0).max(80.0);
+        let available = (width as f32 - 268.0).max(80.0);
         let pinned = self.tabs.iter().filter(|visual| visual.tab.pinned).count();
         let normal = self.tabs.len().saturating_sub(pinned);
         let gap = if self.tabs.is_empty() { 0.0 } else { 5.0 };
@@ -478,32 +521,57 @@ impl NativeUi {
         }
     }
 
-    fn layout(&mut self) {
+    fn layout_address(&self) {
         if self.address.is_null() {
             return;
         }
         let (width, _) = unsafe { client_size(self.window) };
-        self.layout_tabs();
+        let address = address_rect(width, self.visible_pinned_extensions());
+        let (left_pad, right_pad) = if self.current_url.starts_with("http://") {
+            (32, 76)
+        } else {
+            (16, 60)
+        };
         unsafe {
-            let address = address_rect(width);
             move_window_if_needed(
                 self.address,
-                address.left + 34,
+                address.left + left_pad,
                 address.top + 10,
-                (address.right - address.left - 82).max(60),
+                (address.right - address.left - right_pad).max(60),
                 24,
                 1,
             );
-            self.layout_panel();
-            lock_controller(&self.controller).resize_content();
         }
+    }
+
+    fn layout(&mut self) {
+        if self.address.is_null() {
+            return;
+        }
+        self.layout_tabs();
+        self.layout_address();
+        self.layout_panel();
+        BrowserController::resize_content(&self.controller);
         self.update_window_rounding();
+    }
+
+    fn update_dwm_transitions(&self) {
+        let disabled: u32 = u32::from(self.reduce_animations);
+        unsafe {
+            DwmSetWindowAttribute(
+                self.window,
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                &disabled as *const u32 as *const c_void,
+                mem::size_of::<u32>() as u32,
+            );
+        }
     }
 
     fn update_window_rounding(&mut self) {
         unsafe {
             let (width, height) = client_size(self.window);
-            let preference = if self.fullscreen {
+            let zoomed = IsZoomed(self.window) != 0;
+            let preference = if self.fullscreen || zoomed {
                 DWMWCP_DONOTROUND
             } else {
                 DWMWCP_ROUND
@@ -515,7 +583,7 @@ impl NativeUi {
                     &preference as *const u32 as *const c_void,
                     mem::size_of::<u32>() as u32,
                 );
-            } else if self.fullscreen || IsZoomed(self.window) != 0 {
+            } else if self.fullscreen || zoomed {
                 SetWindowRgn(self.window, ptr::null_mut(), 1);
             } else {
                 let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 16, 16);
@@ -564,6 +632,35 @@ impl NativeUi {
         }
     }
 
+    fn visible_pinned_extensions(&self) -> usize {
+        let (width, _) = unsafe { client_size(self.window) };
+        let pinned = self
+            .extensions
+            .iter()
+            .filter(|extension| extension.pinned)
+            .count();
+        let fitting = ((width - 172 - 296) / 44).max(0) as usize;
+        pinned.min(fitting)
+    }
+
+    fn pinned_extension_rects(&self) -> Vec<(usize, RECT)> {
+        let (width, _) = unsafe { client_size(self.window) };
+        let visible = self.visible_pinned_extensions();
+        self.extensions
+            .iter()
+            .enumerate()
+            .filter(|(_, extension)| extension.pinned)
+            .take(visible)
+            .enumerate()
+            .map(|(position, (index, _))| {
+                (
+                    index,
+                    toolbar_rect(width - 160 - (visible - position) as i32 * 44),
+                )
+            })
+            .collect()
+    }
+
     fn bookmark_rects(&self) -> Vec<RECT> {
         let (width, _) = unsafe { client_size(self.window) };
         let item_width = 150.min((width - EDGE_MARGIN * 2).max(80));
@@ -595,6 +692,10 @@ impl NativeUi {
                     54 + self.downloads.len() as i32 * 74
                 },
             ),
+            PanelKind::Extensions => (
+                380.min(width - 24),
+                54 + self.extensions.len().max(1) as i32 * 48 + 44,
+            ),
             PanelKind::Menu => (360.min(width - 24), main_menu_height()),
         };
         let panel_height = desired_height.min((height - content_top - 12).max(90));
@@ -623,7 +724,7 @@ impl NativeUi {
             ClientToScreen(self.window, &mut origin);
             move_window_if_needed(self.overlay_window, origin.x, origin.y, width, height, 0);
             if size_changed {
-                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 28, 28);
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 32, 32);
                 if !region.is_null() {
                     SetWindowRgn(self.overlay_window, region, 1);
                 }
@@ -633,7 +734,8 @@ impl NativeUi {
     }
 
     fn update_address(&mut self, url: &str) {
-        if url == pages::start_page_url() {
+        let was_http = self.current_url.starts_with("http://");
+        if pages::is_internal_page_url(url) {
             self.current_url.clear();
             if !self.address_editing {
                 set_window_text(self.address, "");
@@ -644,6 +746,9 @@ impl NativeUi {
                 set_window_text(self.address, url);
             }
             self.address_editing = false;
+        }
+        if was_http != self.current_url.starts_with("http://") {
+            self.layout_address();
         }
         self.bookmarked = lock_controller(&self.controller).active_is_bookmarked();
         self.close_panels();
@@ -661,8 +766,19 @@ impl NativeUi {
             )
         };
         self.bookmarks = bookmarks;
+        let has_pending_favicons = {
+            let state = lock_controller(&self.controller);
+            for bookmark in &self.bookmarks {
+                state.request_favicon(&bookmark.url, &[]);
+            }
+            state.has_pending_favicons()
+        };
+        if has_pending_favicons {
+            unsafe { SetTimer(self.window, FAVICON_TIMER, 100, None) };
+        }
         self.bookmarked = bookmarked;
         self.show_bookmarks = preferences.show_bookmarks;
+        self.english = preferences.language == storage::Language::English;
         self.palette = Palette::from_preferences(&preferences);
         let dark_theme = preferences.theme == storage::Theme::Dark;
         if self.dark_theme != dark_theme {
@@ -670,6 +786,7 @@ impl NativeUi {
             self.reload_logo_icon();
         }
         self.reduce_animations = preferences.reduce_animations;
+        self.update_dwm_transitions();
         unsafe {
             let background = CreateSolidBrush(self.palette.background);
             let surface = CreateSolidBrush(self.palette.surface);
@@ -687,6 +804,16 @@ impl NativeUi {
             for visual in &mut self.tabs {
                 visual.x.snap(visual.x.target);
                 visual.width.snap(visual.width.target);
+            }
+            if self.panel_alpha.is_active() {
+                self.panel_alpha.snap(self.panel_alpha.target);
+                if self.panel_open {
+                    unsafe {
+                        SetLayeredWindowAttributes(self.overlay_window, 0, 255, LWA_ALPHA);
+                    }
+                } else {
+                    self.finish_close_panel();
+                }
             }
         }
         self.hover = Hit::None;
@@ -716,15 +843,59 @@ impl NativeUi {
     }
 
     fn update_downloads(&mut self) {
-        if self.panel_visible && self.panel == Some(PanelKind::Downloads) {
-            self.downloads = lock_controller(&self.controller).downloads_snapshot();
+        let snapshots = lock_controller(&self.controller).downloads_snapshot();
+        let is_new = snapshots
+            .iter()
+            .any(|download| !self.seen_downloads.contains(&download.id));
+        self.seen_downloads
+            .extend(snapshots.iter().map(|download| download.id));
+        if is_new && !(self.panel_open && self.panel == Some(PanelKind::Downloads)) {
+            self.downloads = snapshots;
+            self.toggle_panel(PanelKind::Downloads);
+        } else if self.panel_open && self.panel == Some(PanelKind::Downloads) {
+            self.downloads = snapshots;
             self.layout_panel();
             unsafe { InvalidateRect(self.overlay_window, ptr::null(), 1) };
         }
     }
 
+    fn update_download_hover(&mut self, hit: DownloadHit) {
+        if hit == self.download_hover {
+            return;
+        }
+        self.previous_download_hover = self.download_hover;
+        self.download_hover = hit;
+        if hit == DownloadHit::None {
+            self.download_hover_transition.set_target(0.0);
+        } else {
+            self.download_hover_transition.snap(0.0);
+            self.download_hover_transition.set_target(1.0);
+        }
+        if self.reduce_animations {
+            self.download_hover_transition
+                .snap(self.download_hover_transition.target);
+        }
+        self.update_animation_timer();
+        unsafe { InvalidateRect(self.overlay_window, ptr::null(), 0) };
+    }
+
+    fn refresh_extensions(&mut self) {
+        self.extensions = lock_controller(&self.controller).extensions_snapshot();
+        self.layout();
+        self.invalidate_toolbar();
+        if self.panel == Some(PanelKind::Extensions) {
+            self.layout_panel();
+            unsafe { InvalidateRect(self.overlay_window, ptr::null(), 0) };
+        }
+    }
+
     fn toggle_downloads(&mut self) {
         self.toggle_panel(PanelKind::Downloads);
+    }
+
+    fn toggle_extensions(&mut self) {
+        self.extensions = lock_controller(&self.controller).extensions_snapshot();
+        self.toggle_panel(PanelKind::Extensions);
     }
 
     fn toggle_menu(&mut self) {
@@ -736,11 +907,18 @@ impl NativeUi {
             self.close_panels();
             return;
         }
-        if panel == PanelKind::Downloads {
-            self.downloads = lock_controller(&self.controller).downloads_snapshot();
-        } else {
-            self.menu_hover = 0;
-            self.downloads = Vec::new();
+        match panel {
+            PanelKind::Downloads => {
+                self.downloads = lock_controller(&self.controller).downloads_snapshot();
+            }
+            PanelKind::Extensions => {
+                self.extension_hover = ExtensionHit::None;
+                self.downloads = Vec::new();
+            }
+            PanelKind::Menu => {
+                self.menu_hover = 0;
+                self.downloads = Vec::new();
+            }
         }
         self.panel = Some(panel);
         self.panel_open = true;
@@ -757,43 +935,62 @@ impl NativeUi {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
-            InvalidateRect(self.overlay_window, ptr::null(), 0);
-            UpdateWindow(self.overlay_window);
             if self.reduce_animations {
-                ShowWindow(self.overlay_window, SW_SHOW);
-            } else {
-                if AnimateWindow(
-                    self.overlay_window,
-                    ANIMATION_DURATION.as_millis() as u32,
-                    AW_BLEND,
-                ) == 0
-                {
-                    ShowWindow(self.overlay_window, SW_SHOW);
-                }
+                self.panel_alpha.snap(1.0);
                 SetLayeredWindowAttributes(self.overlay_window, 0, 255, LWA_ALPHA);
+                ShowWindow(self.overlay_window, SW_SHOWNOACTIVATE);
+                InvalidateRect(self.overlay_window, ptr::null(), 0);
+            } else {
+                if IsWindowVisible(self.overlay_window) == 0 {
+                    self.panel_alpha.snap(0.0);
+                    SetLayeredWindowAttributes(self.overlay_window, 0, 0, LWA_ALPHA);
+                    ShowWindow(self.overlay_window, SW_SHOWNOACTIVATE);
+                }
+                self.panel_alpha.set_target(1.0);
+                InvalidateRect(self.overlay_window, ptr::null(), 0);
+                self.update_animation_timer();
             }
         }
+    }
+
+    fn finish_close_panel(&mut self) {
+        unsafe {
+            ShowWindow(self.overlay_window, SW_HIDE);
+        }
+        self.panel_visible = false;
+        if self.panel == Some(PanelKind::Downloads) {
+            self.downloads = Vec::new();
+            self.download_hover = DownloadHit::None;
+            self.previous_download_hover = DownloadHit::None;
+            self.download_hover_transition.snap(0.0);
+        } else if self.panel == Some(PanelKind::Extensions) {
+            self.extension_hover = ExtensionHit::None;
+        } else if self.panel == Some(PanelKind::Menu) {
+            self.menu_hover = 0;
+        }
+        self.panel = None;
     }
 
     fn close_panels(&mut self) {
         if self.panel_visible && self.panel_open {
             self.panel_open = false;
-            unsafe {
-                if self.reduce_animations
-                    || AnimateWindow(
-                        self.overlay_window,
-                        ANIMATION_DURATION.as_millis() as u32,
-                        AW_BLEND | AW_HIDE,
-                    ) == 0
-                {
-                    ShowWindow(self.overlay_window, SW_HIDE);
-                }
+            if self.reduce_animations {
+                self.panel_alpha.snap(0.0);
+                self.finish_close_panel();
+            } else {
+                self.panel_alpha.set_target(0.0);
             }
-            self.panel_visible = false;
-            if self.panel == Some(PanelKind::Downloads) {
-                self.downloads = Vec::new();
-            }
-            self.panel = None;
+            self.update_animation_timer();
+        }
+        self.update_update_timer();
+    }
+
+    fn close_panels_immediately(&mut self) {
+        if self.panel_visible || self.panel_open || self.panel_alpha.is_active() {
+            self.panel_open = false;
+            self.panel_alpha.snap(0.0);
+            self.finish_close_panel();
+            self.update_animation_timer();
         }
         self.update_update_timer();
     }
@@ -828,7 +1025,9 @@ impl NativeUi {
         let needed = self
             .tabs
             .iter()
-            .any(|visual| visual.x.is_active() || visual.width.is_active());
+            .any(|visual| visual.x.is_active() || visual.width.is_active())
+            || self.download_hover_transition.is_active()
+            || self.panel_alpha.is_active();
         if needed && !self.animation_running {
             self.frame_clock
                 .start(self.window, animation_interval(self.window));
@@ -854,6 +1053,20 @@ impl NativeUi {
                 bottom: TAB_HEIGHT,
             };
             unsafe { InvalidateRect(self.window, &rect, 0) };
+        }
+        let repaint_downloads = self.download_hover_transition.is_active();
+        self.download_hover_transition.step(now);
+        if repaint_downloads {
+            unsafe { InvalidateRect(self.overlay_window, ptr::null(), 0) };
+        }
+        let panel_animating = self.panel_alpha.is_active();
+        self.panel_alpha.step(now);
+        if panel_animating {
+            let alpha = (self.panel_alpha.value * 255.0).round().clamp(0.0, 255.0) as u8;
+            unsafe { SetLayeredWindowAttributes(self.overlay_window, 0, alpha, LWA_ALPHA) };
+            if self.panel_alpha.value == 0.0 && !self.panel_open {
+                self.finish_close_panel();
+            }
         }
         self.update_animation_timer();
         let close = self
@@ -925,13 +1138,20 @@ impl NativeUi {
         }
         let (width, _) = unsafe { client_size(self.window) };
         if y < TAB_HEIGHT {
-            if x >= width - EDGE_MARGIN - 46 {
+            let zoomed = unsafe { IsZoomed(self.window) != 0 };
+            let close_rect = caption_button_rect(width, 0);
+            let maximize_rect = caption_button_rect(width, 1);
+            let minimize_rect = caption_button_rect(width, 2);
+            if zoomed && x >= close_rect.left && y < TAB_BOTTOM {
                 return Hit::CloseWindow;
             }
-            if x >= width - EDGE_MARGIN - 92 {
+            if point_in_rect(x, y, &close_rect) {
+                return Hit::CloseWindow;
+            }
+            if point_in_rect(x, y, &maximize_rect) {
                 return Hit::Maximize;
             }
-            if x >= width - EDGE_MARGIN - 138 {
+            if point_in_rect(x, y, &minimize_rect) {
                 return Hit::Minimize;
             }
             if point_in_rect(x, y, &new_tab_rect(self)) {
@@ -939,24 +1159,38 @@ impl NativeUi {
             }
             for visual in &self.tabs {
                 let left = visual.x.value.round() as i32;
-                let right = left + visual.width.value.round() as i32;
+                let tab_width = visual.width.value.round() as i32;
+                let right = left + tab_width;
                 if x >= left && x < right && (TAB_TOP..TAB_BOTTOM).contains(&y) {
-                    if !visual.tab.pinned && x >= right - 32 {
+                    let hovered = self.hover == Hit::Tab(visual.tab.id)
+                        || self.hover == Hit::TabClose(visual.tab.id);
+                    let show_close =
+                        !visual.tab.pinned && (tab_width >= 72 || visual.tab.active || hovered);
+                    if show_close && x >= right - 32 {
                         return Hit::TabClose(visual.tab.id);
                     }
                     return Hit::Tab(visual.tab.id);
                 }
             }
         } else if (TAB_HEIGHT..TOOLBAR_HEIGHT).contains(&y) {
-            if point_in_rect(x, y, &bookmark_toggle_rect(width)) {
+            if point_in_rect(
+                x,
+                y,
+                &bookmark_toggle_rect(width, self.visible_pinned_extensions()),
+            ) {
                 return Hit::BookmarkToggle;
+            }
+            for (index, rect) in self.pinned_extension_rects() {
+                if point_in_rect(x, y, &rect) {
+                    return Hit::Extension(index);
+                }
             }
             for (hit, rect) in [
                 (Hit::Back, toolbar_rect(16)),
                 (Hit::Forward, toolbar_rect(60)),
                 (Hit::Reload, toolbar_rect(104)),
                 (Hit::Home, toolbar_rect(148)),
-                (Hit::Profile, toolbar_rect(width - 160)),
+                (Hit::Extensions, toolbar_rect(width - 160)),
                 (Hit::Downloads, toolbar_rect(width - 108)),
                 (Hit::Menu, toolbar_rect(width - 56)),
             ] {
@@ -983,25 +1217,34 @@ impl NativeUi {
             Hit::Reload => BrowserController::reload_or_stop(&self.controller),
             Hit::Home => BrowserController::go_home(&self.controller),
             Hit::NewTab => {
-                BrowserController::new_tab(&self.controller, &pages::start_page_url(), false)
+                let url = lock_controller(&self.controller).start_page_url();
+                BrowserController::new_tab(&self.controller, &url, false);
             }
             Hit::Downloads => self.toggle_downloads(),
-            Hit::Profile => BrowserController::open_internal_page(
-                &self.controller,
-                ui::internal::InternalPage::Profile,
-            ),
+            Hit::Extensions => self.toggle_extensions(),
+            Hit::Extension(index) => {
+                if let Some(id) = self
+                    .extensions
+                    .get(index)
+                    .map(|extension| extension.id.clone())
+                {
+                    BrowserController::open_extension(&self.controller, &id);
+                }
+            }
             Hit::Menu => self.toggle_menu(),
             Hit::Minimize => unsafe {
-                ShowWindow(self.window, SW_MINIMIZE);
+                PostMessageW(self.window, WM_SYSCOMMAND, SC_MINIMIZE as WPARAM, 0);
             },
             Hit::Maximize => unsafe {
-                ShowWindow(
+                PostMessageW(
                     self.window,
+                    WM_SYSCOMMAND,
                     if IsZoomed(self.window) != 0 {
-                        SW_RESTORE
+                        SC_RESTORE
                     } else {
-                        SW_MAXIMIZE
-                    },
+                        SC_MAXIMIZE
+                    } as WPARAM,
+                    0,
                 );
             },
             Hit::CloseWindow => unsafe {
@@ -1078,12 +1321,7 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
             WS_EX_APPWINDOW,
             wide("KockersBrowserWindow").as_ptr(),
             wide(title).as_ptr(),
-            WS_POPUP
-                | WS_THICKFRAME
-                | WS_MINIMIZEBOX
-                | WS_MAXIMIZEBOX
-                | WS_CLIPCHILDREN
-                | WS_CLIPSIBLINGS,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             INITIAL_WIDTH,
@@ -1099,6 +1337,7 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
         }
         let ui = &mut *ui_ptr;
         ui.window = window;
+        lock_controller(&ui.controller).set_window(window);
         if let Err(error) = ui.create_controls(instance) {
             DestroyWindow(window);
             return Err(error);
@@ -1118,6 +1357,7 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
             &DWMWA_COLOR_NONE as *const u32 as *const c_void,
             mem::size_of::<u32>() as u32,
         );
+        ui.update_dwm_transitions();
         if !small_icon.is_null() {
             SendMessageW(window, WM_SETICON, ICON_SMALL as usize, small_icon as isize);
         }
@@ -1126,6 +1366,15 @@ pub fn create_main_window(controller: SharedController) -> Result<HWND, String> 
         }
         OPEN_WINDOWS.fetch_add(1, Ordering::SeqCst);
         ui.counted = true;
+        SetWindowPos(
+            window,
+            ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
         ShowWindow(window, SW_SHOW);
         UpdateWindow(window);
         Ok(window)
@@ -1214,32 +1463,65 @@ pub unsafe fn resize_browsers(window: HWND, browsers: &[(u64, HWND)], active: Op
 
 pub(crate) fn apply_browser_visibility(
     window: HWND,
-    browsers: &[(u64, HWND)],
+    browsers: &[(u64, HWND, bool)],
     active: Option<u64>,
 ) {
-    unsafe { resize_browsers(window, browsers, active) };
-    for (id, handle) in browsers {
-        if handle.is_null() {
+    let (width, height) = unsafe { client_size(window) };
+    let top = content_top(window);
+    let content_height = (height - top).max(0);
+    if let Some((_, active_handle, ready)) = browsers
+        .iter()
+        .find(|(id, handle, _)| active == Some(*id) && !handle.is_null())
+    {
+        unsafe {
+            if *ready {
+                SetWindowPos(
+                    *active_handle,
+                    HWND_TOP,
+                    0,
+                    top,
+                    width,
+                    content_height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+                ShowWindow(*active_handle, SW_SHOW);
+            } else {
+                SetWindowPos(
+                    *active_handle,
+                    HWND_BOTTOM,
+                    0,
+                    top,
+                    width,
+                    content_height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+    for (id, handle, _) in browsers {
+        if handle.is_null() || active == Some(*id) {
             continue;
         }
         unsafe {
-            ShowWindow(
-                *handle,
-                if active == Some(*id) {
-                    SW_SHOW
-                } else {
-                    SW_HIDE
-                },
-            );
+            ShowWindow(*handle, SW_HIDE);
         }
     }
 }
 
-pub(crate) const REVEAL_AFTER_LOAD_MS: u32 = 30;
-pub(crate) const REVEAL_FALLBACK_MS: u32 = 400;
+pub(crate) const REVEAL_FALLBACK_MS: u32 = 300;
 
 pub(crate) fn schedule_reveal(window: HWND, delay: u32) {
     unsafe { SetTimer(window, REVEAL_TIMER, delay, None) };
+}
+
+pub(crate) fn cancel_reveal(window: HWND) {
+    if !window.is_null() {
+        unsafe { KillTimer(window, REVEAL_TIMER) };
+    }
+}
+
+pub(crate) fn schedule_favicon_refresh(window: HWND) {
+    unsafe { SetTimer(window, FAVICON_TIMER, 100, None) };
 }
 
 pub(crate) fn stage_browser(window: HWND, browser: HWND) {
@@ -1306,9 +1588,45 @@ pub fn update_downloads(window: HWND) {
     }
 }
 
+pub(crate) fn confirm_extension_install(window: HWND, id: &str) -> bool {
+    let english = ui_mut(window).is_some_and(|ui| ui.english);
+    let message = if english {
+        format!("Extension {id} will be installed after restarting Kockers. Restart now?")
+    } else {
+        format!(
+            "Расширение {id} будет установлено после перезапуска Kockers. Перезапустить сейчас?"
+        )
+    };
+    let caption = if english {
+        "KOCKERS — Install extension"
+    } else {
+        "KOCKERS — установка расширения"
+    };
+    unsafe {
+        MessageBoxW(
+            window,
+            wide(&message).as_ptr(),
+            wide(caption).as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
+pub(crate) fn close_for_restart(window: HWND) {
+    if !window.is_null() {
+        unsafe { PostMessageW(window, WM_CLOSE, 0, 0) };
+    }
+}
+
 pub fn refresh_bookmarks(window: HWND) {
     if let Some(ui) = ui_mut(window) {
         ui.refresh_bookmarks();
+    }
+}
+
+pub fn refresh_extensions(window: HWND) {
+    if let Some(ui) = ui_mut(window) {
+        ui.refresh_extensions();
     }
 }
 
@@ -1346,6 +1664,22 @@ pub(crate) fn post_tab_closed(window: HWND, id: u64) {
 pub(crate) fn post_browser_destroy(window: HWND, browser: HWND) {
     if !window.is_null() && !browser.is_null() {
         unsafe { PostMessageW(window, WM_DESTROY_TAB, browser as WPARAM, 0) };
+    }
+}
+
+pub(crate) fn post_close_orphans(window: HWND) {
+    if !window.is_null() {
+        unsafe { PostMessageW(window, WM_CLOSE_ORPHANS, 0, 0) };
+    }
+}
+
+pub(crate) fn post_extension_installed(window: HWND, result: Result<String, String>) {
+    if window.is_null() {
+        return;
+    }
+    let boxed = Box::into_raw(Box::new(result));
+    if unsafe { PostMessageW(window, WM_EXTENSION_INSTALLED, boxed as WPARAM, 0) } == 0 {
+        unsafe { drop(Box::from_raw(boxed)) };
     }
 }
 
@@ -1548,30 +1882,34 @@ pub unsafe fn toggle_fullscreen(window: HWND) {
     unsafe {
         if ui.fullscreen {
             ui.fullscreen = false;
+            if ui.restore_maximized {
+                ShowWindow(window, SW_MAXIMIZE);
+            } else {
+                let rect = ui.restore_rect;
+                SetWindowPos(
+                    window,
+                    ptr::null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             ui.update_window_rounding();
-            let rect = ui.restore_rect;
-            SetWindowPos(
-                window,
-                ptr::null_mut(),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
             ShowWindow(ui.address, SW_SHOW);
         } else {
+            ui.restore_maximized = IsZoomed(window) != 0;
+            if ui.restore_maximized {
+                ShowWindow(window, SW_RESTORE);
+            }
             GetWindowRect(window, &mut ui.restore_rect);
             ui.fullscreen = true;
             ui.panel_open = false;
-            ui.panel_visible = false;
-            if ui.panel == Some(PanelKind::Downloads) {
-                ui.downloads = Vec::new();
-            }
-            ui.panel = None;
+            ui.panel_alpha.snap(0.0);
+            ui.finish_close_panel();
             ui.hover = Hit::None;
             ui.pressed = Hit::None;
-            ShowWindow(ui.overlay_window, SW_HIDE);
             ShowWindow(ui.address, SW_HIDE);
             ui.update_window_rounding();
             let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
@@ -1659,18 +1997,56 @@ unsafe extern "system" fn window_proc(
             }
             WM_NCCALCSIZE => {
                 if wparam != 0 {
+                    if IsZoomed(window) != 0 && !ui_mut(window).is_some_and(|ui| ui.fullscreen) {
+                        let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+                        let mut monitor_info = MONITORINFO {
+                            cbSize: mem::size_of::<MONITORINFO>() as u32,
+                            ..Default::default()
+                        };
+                        if GetMonitorInfoW(monitor, &mut monitor_info) != 0 {
+                            let mut work = monitor_info.rcWork;
+                            adjust_for_autohide_taskbar(&mut work, &monitor_info.rcMonitor);
+                            let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
+                            params.rgrc[0] = work;
+                        }
+                    }
                     return 0;
                 }
             }
             WM_NCHITTEST => return non_client_hit_test(window, lparam),
             WM_NCPAINT => return 0,
-            WM_NCACTIVATE => return 1,
+            WM_NCACTIVATE => {
+                if IsIconic(window) != 0 {
+                    return DefWindowProcW(window, message, wparam, lparam);
+                }
+                return 1;
+            }
             WM_ERASEBKGND => return 1,
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(window, &mut paint);
                 if let Some(ui) = ui_mut(window) {
-                    paint_toolbar(ui, dc, paint.rcPaint.bottom <= TAB_HEIGHT);
+                    let tabs_only = paint.rcPaint.bottom <= TAB_HEIGHT;
+                    paint_toolbar(ui, dc, tabs_only);
+                    if !tabs_only && paint.rcPaint.bottom > ui.content_top() {
+                        let (width, height) = client_size(window);
+                        let content_rect = RECT {
+                            left: 0,
+                            top: ui.content_top(),
+                            right: width,
+                            bottom: height,
+                        };
+                        let color = if ui.dark_theme {
+                            rgb(0x17, 0x19, 0x17)
+                        } else {
+                            rgb(0xF7, 0xF7, 0xF4)
+                        };
+                        let brush = CreateSolidBrush(color);
+                        if !brush.is_null() {
+                            FillRect(dc, &content_rect, brush);
+                            DeleteObject(brush as HGDIOBJ);
+                        }
+                    }
                 }
                 EndPaint(window, &paint);
                 return 0;
@@ -1687,22 +2063,31 @@ unsafe extern "system" fn window_proc(
                 }
                 return 0;
             }
-            WM_SIZE | WM_DPICHANGED => {
+            WM_SIZE => {
+                if let Some(ui) = ui_mut(window) {
+                    if wparam == SIZE_MINIMIZED as usize {
+                        ui.close_panels_immediately();
+                        return 0;
+                    }
+                    ui.layout();
+                    ui.invalidate_tab_strip();
+                }
+                return 0;
+            }
+            WM_DPICHANGED => {
                 if let Some(ui) = ui_mut(window) {
                     ui.layout();
                 }
-                if message == WM_DPICHANGED {
-                    let suggested = &*(lparam as *const RECT);
-                    SetWindowPos(
-                        window,
-                        ptr::null_mut(),
-                        suggested.left,
-                        suggested.top,
-                        suggested.right - suggested.left,
-                        suggested.bottom - suggested.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
+                let suggested = &*(lparam as *const RECT);
+                SetWindowPos(
+                    window,
+                    ptr::null_mut(),
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
                 return 0;
             }
             WM_GETMINMAXINFO => {
@@ -1743,6 +2128,18 @@ unsafe extern "system" fn window_proc(
             WM_TIMER if wparam == UPDATE_TIMER => {
                 if let Some(ui) = ui_mut(window) {
                     ui.refresh_update();
+                }
+                return 0;
+            }
+            WM_TIMER if wparam == FAVICON_TIMER => {
+                if let Some(ui) = ui_mut(window) {
+                    if ui.refresh_tabs() {
+                        ui.invalidate_tab_strip();
+                    }
+                    ui.invalidate_area(TOOLBAR_HEIGHT, ui.content_top());
+                    if !lock_controller(&ui.controller).has_pending_favicons() {
+                        KillTimer(window, FAVICON_TIMER);
+                    }
                 }
                 return 0;
             }
@@ -1803,6 +2200,7 @@ unsafe extern "system" fn window_proc(
                     let hit = ui.hit_test(x, y);
                     let toggle_hit = match ui.panel {
                         Some(PanelKind::Downloads) => Hit::Downloads,
+                        Some(PanelKind::Extensions) => Hit::Extensions,
                         Some(PanelKind::Menu) => Hit::Menu,
                         None => Hit::None,
                     };
@@ -1872,6 +2270,22 @@ unsafe extern "system" fn window_proc(
                 if let Some(ui) = ui_mut(window) {
                     let controller = ui.controller.clone();
                     BrowserController::finish_tab_close(&controller, wparam as u64);
+                }
+                return 0;
+            }
+            WM_CLOSE_ORPHANS => {
+                if let Some(controller) = ui_mut(window).map(|ui| ui.controller.clone()) {
+                    BrowserController::close_orphan_browsers(&controller);
+                }
+                return 0;
+            }
+            WM_EXTENSION_INSTALLED => {
+                let raw = wparam as *mut Result<String, String>;
+                if !raw.is_null() {
+                    let result = *Box::from_raw(raw);
+                    if let Some(controller) = ui_mut(window).map(|ui| ui.controller.clone()) {
+                        BrowserController::handle_extension_installed(&controller, window, result);
+                    }
                 }
                 return 0;
             }
@@ -1954,11 +2368,15 @@ unsafe extern "system" fn window_proc(
                     ui.destroy_resources();
                     let last_window =
                         ui.counted && OPEN_WINDOWS.fetch_sub(1, Ordering::SeqCst) == 1;
+                    if last_window {
+                        super::icons::clear_image_cache();
+                    }
                     let keep_background = {
                         let state = lock_controller(&ui.controller);
                         !state.is_private() && state.preferences().continue_background
                     };
-                    if last_window && !keep_background {
+                    if last_window && (!keep_background || crate::extensions::is_restart_requested())
+                    {
                         cef::quit_message_loop();
                     }
                 }
@@ -1989,6 +2407,7 @@ unsafe extern "system" fn mouse_proc(code: i32, message: WPARAM, data: LPARAM) -
                 let hit = ui.hit_test(point.x, point.y);
                 let toggle_hit = match ui.panel {
                     Some(PanelKind::Downloads) => Hit::Downloads,
+                    Some(PanelKind::Extensions) => Hit::Extensions,
                     Some(PanelKind::Menu) => Hit::Menu,
                     None => Hit::None,
                 };
@@ -2016,6 +2435,7 @@ unsafe extern "system" fn overlay_proc(
                 if let Some(ui) = ui_mut(parent) {
                     match ui.panel {
                         Some(PanelKind::Downloads) => draw_download_panel(ui, wparam as HDC),
+                        Some(PanelKind::Extensions) => draw_extensions_panel(ui, wparam as HDC),
                         Some(PanelKind::Menu) => draw_main_menu(ui, wparam as HDC),
                         None => {}
                     }
@@ -2036,6 +2456,7 @@ unsafe extern "system" fn overlay_proc(
                     if let Some(ui) = ui_mut(parent) {
                         match ui.panel {
                             Some(PanelKind::Downloads) => draw_download_panel(ui, memory),
+                            Some(PanelKind::Extensions) => draw_extensions_panel(ui, memory),
                             Some(PanelKind::Menu) => draw_main_menu(ui, memory),
                             None => {}
                         }
@@ -2045,6 +2466,7 @@ unsafe extern "system" fn overlay_proc(
                 } else if let Some(ui) = ui_mut(parent) {
                     match ui.panel {
                         Some(PanelKind::Downloads) => draw_download_panel(ui, dc),
+                        Some(PanelKind::Extensions) => draw_extensions_panel(ui, dc),
                         Some(PanelKind::Menu) => draw_main_menu(ui, dc),
                         None => {}
                     }
@@ -2059,26 +2481,52 @@ unsafe extern "system" fn overlay_proc(
                 0
             }
             WM_MOUSEMOVE => {
+                let x = low_word(lparam) as i32;
                 let y = high_word(lparam) as i32;
-                if let Some(ui) = ui_mut(parent)
-                    && ui.panel == Some(PanelKind::Menu)
-                {
-                    let hover = main_menu_command_at(y).unwrap_or(0);
-                    if ui.menu_hover != hover {
-                        ui.menu_hover = hover;
-                        InvalidateRect(window, ptr::null(), 0);
+                if let Some(ui) = ui_mut(parent) {
+                    if !ui.panel_open {
+                        return 0;
+                    }
+                    match ui.panel {
+                        Some(PanelKind::Menu) => {
+                            let hover = main_menu_command_at(y).unwrap_or(0);
+                            if ui.menu_hover != hover {
+                                ui.menu_hover = hover;
+                                InvalidateRect(window, ptr::null(), 0);
+                            }
+                        }
+                        Some(PanelKind::Downloads) => {
+                            ui.update_download_hover(download_hit_at(ui, x, y));
+                        }
+                        Some(PanelKind::Extensions) => {
+                            let hover = extension_hit_at(ui, x, y);
+                            if ui.extension_hover != hover {
+                                ui.extension_hover = hover;
+                                InvalidateRect(window, ptr::null(), 0);
+                            }
+                        }
+                        None => {}
                     }
                     track_mouse_leave(window);
                 }
                 0
             }
             WM_MOUSELEAVE => {
-                if let Some(ui) = ui_mut(parent)
-                    && ui.panel == Some(PanelKind::Menu)
-                    && ui.menu_hover != 0
-                {
-                    ui.menu_hover = 0;
-                    InvalidateRect(window, ptr::null(), 0);
+                if let Some(ui) = ui_mut(parent) {
+                    match ui.panel {
+                        Some(PanelKind::Menu) if ui.menu_hover != 0 => {
+                            ui.menu_hover = 0;
+                            InvalidateRect(window, ptr::null(), 0);
+                        }
+                        Some(PanelKind::Downloads) => {
+                            ui.update_download_hover(DownloadHit::None);
+                        }
+                        Some(PanelKind::Extensions) => {
+                            ui.extension_hover = ExtensionHit::None;
+                            InvalidateRect(window, ptr::null(), 0);
+                        }
+                        _ => {}
+                    }
                 }
                 0
             }
@@ -2091,6 +2539,9 @@ unsafe extern "system" fn overlay_proc(
                 let x = low_word(lparam) as i32;
                 let y = high_word(lparam) as i32;
                 if let Some(ui) = ui_mut(parent) {
+                    if !ui.panel_open {
+                        return 0;
+                    }
                     match ui.panel {
                         Some(PanelKind::Menu) => {
                             if let Some(mut command) = main_menu_command_at(y) {
@@ -2133,34 +2584,59 @@ unsafe extern "system" fn overlay_proc(
                                 }
                             }
                         }
-                        Some(PanelKind::Downloads) => {
-                            let (width, _) = client_size(window);
-                            if y < 50 && x > width - 48 {
+                        Some(PanelKind::Extensions) => match extension_hit_at(ui, x, y) {
+                            ExtensionHit::Action(index) => {
+                                if let Some(id) = ui
+                                    .extensions
+                                    .get(index)
+                                    .map(|extension| extension.id.clone())
+                                {
+                                    ui.close_panels();
+                                    BrowserController::open_extension(&ui.controller, &id);
+                                }
+                            }
+                            ExtensionHit::Pin(index) => {
+                                if let Some(id) = ui
+                                    .extensions
+                                    .get(index)
+                                    .map(|extension| extension.id.clone())
+                                {
+                                    BrowserController::toggle_extension_pin(&ui.controller, &id);
+                                }
+                            }
+                            ExtensionHit::Manage => {
                                 ui.close_panels();
-                            } else if y >= 54 {
-                                let index = ((y - 54) / 74) as usize;
+                                BrowserController::open_extensions(&ui.controller);
+                            }
+                            ExtensionHit::None => {}
+                        },
+                        Some(PanelKind::Downloads) => match download_hit_at(ui, x, y) {
+                            DownloadHit::Close => ui.close_panels(),
+                            DownloadHit::Cancel(index) => {
                                 if let Some(download) = ui.downloads.get(index).cloned() {
-                                    if x >= width - 58 {
-                                        BrowserController::cancel_download(
+                                    BrowserController::cancel_download(
+                                        &ui.controller,
+                                        download.id,
+                                    );
+                                }
+                            }
+                            DownloadHit::Action(index) => {
+                                if let Some(download) = ui.downloads.get(index).cloned() {
+                                    if download.status == DownloadStatus::Complete {
+                                        BrowserController::open_download(
                                             &ui.controller,
                                             download.id,
                                         );
-                                    } else if x >= width - 124 {
-                                        if download.status == DownloadStatus::Complete {
-                                            BrowserController::open_download(
-                                                &ui.controller,
-                                                download.id,
-                                            );
-                                        } else {
-                                            BrowserController::toggle_download_pause(
-                                                &ui.controller,
-                                                download.id,
-                                            );
-                                        }
+                                    } else {
+                                        BrowserController::toggle_download_pause(
+                                            &ui.controller,
+                                            download.id,
+                                        );
                                     }
                                 }
                             }
-                        }
+                            DownloadHit::None => {}
+                        },
                         None => {}
                     }
                 }
@@ -2248,7 +2724,11 @@ unsafe fn draw_address_overlay(address: HWND) {
         SelectObject(dc, ui.font as HGDIOBJ);
         if text.is_empty() {
             SetTextColor(dc, ui.palette.secondary);
-            let mut placeholder = wide("Адрес или поиск");
+            let mut placeholder = wide(if ui.english {
+                "Address or search"
+            } else {
+                "Адрес или поиск"
+            });
             rect.left += 6;
             rect.right -= 8;
             DrawTextW(
@@ -2280,7 +2760,10 @@ fn handle_native_shortcut(window: HWND, key: i32) -> bool {
         }
         0x42 if control && shift => BrowserController::toggle_bookmarks_bar(&controller),
         0x54 if control && shift => BrowserController::restore_closed_tab(&controller),
-        0x54 if control => BrowserController::new_tab(&controller, &pages::start_page_url(), false),
+        0x54 if control => {
+            let url = lock_controller(&controller).start_page_url();
+            BrowserController::new_tab(&controller, &url, false);
+        }
         0x57 if control => BrowserController::close_active_tab(&controller),
         0x4E if control && shift => BrowserController::open_private_window(),
         value if value == VK_TAB as i32 && control => {
@@ -2432,17 +2915,27 @@ fn new_tab_rect(ui: &NativeUi) -> RECT {
     }
 }
 
-fn address_rect(width: i32) -> RECT {
+fn caption_button_rect(width: i32, slot_from_right: i32) -> RECT {
+    let right = width - EDGE_MARGIN - slot_from_right * 46;
+    RECT {
+        left: right - 46,
+        top: TAB_TOP,
+        right,
+        bottom: TAB_BOTTOM,
+    }
+}
+
+fn address_rect(width: i32, pinned_extensions: usize) -> RECT {
     RECT {
         left: 196,
         top: TAB_HEIGHT + TOOLBAR_GAP,
-        right: (width - 216).max(296),
+        right: (width - 172 - pinned_extensions as i32 * 44).max(296),
         bottom: TOOLBAR_HEIGHT - TOOLBAR_GAP,
     }
 }
 
-fn bookmark_toggle_rect(width: i32) -> RECT {
-    let address = address_rect(width);
+fn bookmark_toggle_rect(width: i32, pinned_extensions: usize) -> RECT {
+    let address = address_rect(width, pinned_extensions);
     RECT {
         left: address.right - 40,
         top: address.top + 2,
@@ -2494,8 +2987,9 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
             DI_NORMAL,
         );
         if !tabs_only {
-            let address = address_rect(width);
-            fill_round_rect(memory, &address, ui.palette.surface, 20, None);
+            let pinned_extensions = ui.visible_pinned_extensions();
+            let address = address_rect(width, pinned_extensions);
+            fill_round_rect(memory, &address, ui.palette.surface, 22, None);
             if ui.current_url.starts_with("http://") {
                 let warning = RECT {
                     left: address.left + 8,
@@ -2509,7 +3003,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
                 memory,
                 ui,
                 Hit::BookmarkToggle,
-                bookmark_toggle_rect(width),
+                bookmark_toggle_rect(width, pinned_extensions),
                 if ui.bookmarked {
                     Icon::BookmarkFilled
                 } else {
@@ -2559,12 +3053,25 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
                 true,
             );
             draw_button(memory, ui, Hit::Home, toolbar_rect(148), Icon::Home, true);
+            for (index, rect) in ui.pinned_extension_rects() {
+                let hit = Hit::Extension(index);
+                if ui.hover == hit || ui.pressed == hit {
+                    fill_round_rect(memory, &rect, ui.palette.hover, 12, None);
+                }
+                let icon_drawn = ui.extensions[index]
+                    .icon_path
+                    .as_ref()
+                    .is_some_and(|path| draw_image(memory, &rect, path, 16));
+                if !icon_drawn {
+                    draw_icon(memory, &rect, Icon::Extensions, ui.palette.secondary);
+                }
+            }
             draw_button(
                 memory,
                 ui,
-                Hit::Profile,
+                Hit::Extensions,
                 toolbar_rect(width - 160),
-                Icon::Profile,
+                Icon::Extensions,
                 true,
             );
             draw_button(
@@ -2588,12 +3095,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
             memory,
             ui,
             Hit::Minimize,
-            RECT {
-                left: width - EDGE_MARGIN - 138,
-                top: 0,
-                right: width - EDGE_MARGIN - 92,
-                bottom: TAB_HEIGHT,
-            },
+            caption_button_rect(width, 2),
             Icon::Minimize,
             true,
         );
@@ -2601,12 +3103,7 @@ unsafe fn paint_toolbar(ui: &mut NativeUi, dc: HDC, tabs_only: bool) {
             memory,
             ui,
             Hit::Maximize,
-            RECT {
-                left: width - EDGE_MARGIN - 92,
-                top: 0,
-                right: width - EDGE_MARGIN - 46,
-                bottom: TAB_HEIGHT,
-            },
+            caption_button_rect(width, 1),
             if IsZoomed(ui.window) != 0 {
                 Icon::Restore
             } else {
@@ -2648,7 +3145,11 @@ unsafe fn draw_bookmarks(ui: &NativeUi, dc: HDC) {
             };
             draw_text(
                 dc,
-                "Ctrl+D — добавить текущую страницу в закладки",
+                if ui.english {
+                    "Ctrl+D — bookmark this page"
+                } else {
+                    "Ctrl+D — добавить текущую страницу в закладки"
+                },
                 &empty,
                 ui.small_font,
                 ui.palette.secondary,
@@ -2656,6 +3157,13 @@ unsafe fn draw_bookmarks(ui: &NativeUi, dc: HDC) {
             );
             return;
         }
+        let favicons = {
+            let state = lock_controller(&ui.controller);
+            ui.bookmarks
+                .iter()
+                .map(|bookmark| state.favicon(&bookmark.url))
+                .collect::<Vec<_>>()
+        };
         for (index, rect) in ui.bookmark_rects().into_iter().enumerate() {
             if ui.hover == Hit::Bookmark(index) {
                 fill_round_rect(dc, &rect, ui.palette.hover, 9, None);
@@ -2666,7 +3174,12 @@ unsafe fn draw_bookmarks(ui: &NativeUi, dc: HDC) {
                 right: rect.left + 28,
                 bottom: rect.bottom,
             };
-            draw_icon(dc, &icon, Icon::Bookmark, ui.palette.secondary);
+            if !favicons[index]
+                .as_ref()
+                .is_some_and(|path| draw_image(dc, &icon, path, 16))
+            {
+                draw_icon(dc, &icon, Icon::Bookmark, ui.palette.secondary);
+            }
             let title = RECT {
                 left: rect.left + 29,
                 top: rect.top,
@@ -2725,26 +3238,56 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
             return;
         }
         IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
+        let tab_width = rect.right - rect.left;
+        let indicator = if visual.tab.pinned {
+            let left = rect.left + (tab_width - 18) / 2;
+            RECT {
+                left,
+                top: rect.top + 11,
+                right: left + 18,
+                bottom: rect.top + 29,
+            }
+        } else {
+            RECT {
+                left: rect.left + 8,
+                top: rect.top + 11,
+                right: rect.left + 26,
+                bottom: rect.top + 29,
+            }
+        };
+        let mut icon_drawn = visual
+            .tab
+            .favicon
+            .as_ref()
+            .is_some_and(|path| draw_image(dc, &indicator, path, 18));
+        if !icon_drawn && visual.tab.internal {
+            draw_icon(dc, &indicator, Icon::Kockers, ui.palette.secondary);
+            icon_drawn = true;
+        }
         if visual.tab.pinned {
-            let initial = visual.tab.title.chars().next().unwrap_or('•').to_string();
-            draw_text(
-                dc,
-                &initial,
-                &rect,
-                ui.title_font,
-                if active {
-                    ui.palette.accent
-                } else {
-                    ui.palette.secondary
-                },
-                DT_CENTER,
-            );
+            if !icon_drawn {
+                let initial = visual.tab.title.chars().next().unwrap_or('•').to_string();
+                draw_text(
+                    dc,
+                    &initial,
+                    &rect,
+                    ui.title_font,
+                    if active {
+                        ui.palette.accent
+                    } else {
+                        ui.palette.secondary
+                    },
+                    DT_CENTER,
+                );
+            }
             RestoreDC(dc, saved);
             return;
         }
+        let show_close = tab_width >= 72 || active || hovered;
+        let has_leading_indicator = icon_drawn || visual.tab.loading;
         let mut title_rect = rect;
-        title_rect.left += if visual.tab.loading { 28 } else { 13 };
-        title_rect.right -= 34;
+        title_rect.left += if has_leading_indicator { 30 } else { 12 };
+        title_rect.right -= if show_close { 34 } else { 8 };
         draw_text(
             dc,
             &visual.tab.title,
@@ -2757,13 +3300,7 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
             },
             DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
-        if visual.tab.loading {
-            let indicator = RECT {
-                left: rect.left + 6,
-                top: rect.top + 11,
-                right: rect.left + 24,
-                bottom: rect.top + 29,
-            };
+        if visual.tab.loading && !icon_drawn {
             draw_text(
                 dc,
                 "•",
@@ -2773,31 +3310,33 @@ unsafe fn draw_tab(ui: &NativeUi, dc: HDC, visual: &TabVisual) {
                 DT_CENTER,
             );
         }
-        let close = RECT {
-            left: rect.right - 32,
-            top: TAB_TOP + 7,
-            right: rect.right - 6,
-            bottom: TAB_BOTTOM - 7,
-        };
-        if ui.hover == Hit::TabClose(visual.tab.id) {
-            fill_round_rect(dc, &close, ui.palette.hover, 9, None);
+        if show_close {
+            let close = RECT {
+                left: rect.right - 32,
+                top: TAB_TOP + 7,
+                right: rect.right - 6,
+                bottom: TAB_BOTTOM - 7,
+            };
+            if ui.hover == Hit::TabClose(visual.tab.id) {
+                fill_round_rect(dc, &close, ui.palette.hover, 9, None);
+            }
+            draw_icon(dc, &close, Icon::Close, ui.palette.secondary);
         }
-        draw_icon(dc, &close, Icon::Close, ui.palette.secondary);
         RestoreDC(dc, saved);
     }
 }
 
-use super::icons::{Icon, draw_icon};
+use super::icons::{Icon, draw_icon, draw_image};
 
 unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, enabled: bool) {
     unsafe {
         if enabled && (ui.hover == hit || ui.pressed == hit) {
             if matches!(hit, Hit::Minimize | Hit::Maximize) {
                 let highlight = RECT {
-                    left: rect.left + 5,
-                    top: rect.top + 9,
-                    right: rect.right - 5,
-                    bottom: rect.bottom - 9,
+                    left: rect.left + 3,
+                    top: rect.top + 2,
+                    right: rect.right - 3,
+                    bottom: rect.bottom - 2,
                 };
                 fill_round_rect(dc, &highlight, ui.palette.hover, 10, None);
             } else {
@@ -2819,19 +3358,14 @@ unsafe fn draw_button(dc: HDC, ui: &NativeUi, hit: Hit, rect: RECT, icon: Icon, 
 
 unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
     unsafe {
-        let rect = RECT {
-            left: width - EDGE_MARGIN - 46,
-            top: 0,
-            right: width - EDGE_MARGIN,
-            bottom: TAB_HEIGHT,
-        };
+        let rect = caption_button_rect(width, 0);
         let hovered = ui.hover == Hit::CloseWindow || ui.pressed == Hit::CloseWindow;
         if hovered {
             let highlight = RECT {
-                left: rect.left + 5,
-                top: rect.top + 9,
-                right: rect.right - 5,
-                bottom: rect.bottom - 9,
+                left: rect.left + 3,
+                top: rect.top + 2,
+                right: rect.right - 3,
+                bottom: rect.bottom - 2,
             };
             fill_round_rect(dc, &highlight, CLOSE_HOVER, 10, None);
         }
@@ -2848,6 +3382,250 @@ unsafe fn draw_caption_close(ui: &NativeUi, dc: HDC, width: i32) {
     }
 }
 
+const EXTENSION_LIST_TOP: i32 = 54;
+const EXTENSION_ROW_HEIGHT: i32 = 48;
+const EXTENSION_MANAGE_HEIGHT: i32 = 44;
+
+fn extension_hit_at(ui: &NativeUi, x: i32, y: i32) -> ExtensionHit {
+    let (width, height) = unsafe { client_size(ui.overlay_window) };
+    if y >= height - EXTENSION_MANAGE_HEIGHT {
+        return ExtensionHit::Manage;
+    }
+    if y < EXTENSION_LIST_TOP || y >= height - EXTENSION_MANAGE_HEIGHT {
+        return ExtensionHit::None;
+    }
+    let index = ((y - EXTENSION_LIST_TOP) / EXTENSION_ROW_HEIGHT) as usize;
+    if index >= ui.extensions.len() {
+        return ExtensionHit::None;
+    }
+    if x >= width - 116 {
+        ExtensionHit::Pin(index)
+    } else {
+        ExtensionHit::Action(index)
+    }
+}
+
+unsafe fn draw_extensions_panel(ui: &NativeUi, dc: HDC) {
+    unsafe {
+        let mut client = RECT::default();
+        GetClientRect(ui.overlay_window, &mut client);
+        FillRect(dc, &client, ui.background_brush);
+        fill_round_rect(
+            dc,
+            &client,
+            ui.palette.surface,
+            16,
+            Some(ui.palette.divider),
+        );
+        SetBkMode(dc, TRANSPARENT as i32);
+        let english = ui.english;
+        let text = |russian, english_text| if english { english_text } else { russian };
+        let title = RECT {
+            left: 18,
+            top: 8,
+            right: client.right - 18,
+            bottom: 44,
+        };
+        draw_text(
+            dc,
+            text("Расширения", "Extensions"),
+            &title,
+            ui.font,
+            ui.palette.foreground,
+            DT_LEFT | DT_END_ELLIPSIS,
+        );
+        if ui.extensions.is_empty() {
+            let empty = RECT {
+                left: 18,
+                top: EXTENSION_LIST_TOP,
+                right: client.right - 18,
+                bottom: EXTENSION_LIST_TOP + EXTENSION_ROW_HEIGHT,
+            };
+            draw_text(
+                dc,
+                text("Нет установленных расширений", "No installed extensions"),
+                &empty,
+                ui.small_font,
+                ui.palette.secondary,
+                DT_LEFT | DT_END_ELLIPSIS,
+            );
+        }
+        let list_bottom = client.bottom - EXTENSION_MANAGE_HEIGHT;
+        for (index, extension) in ui.extensions.iter().enumerate() {
+            let top = EXTENSION_LIST_TOP + index as i32 * EXTENSION_ROW_HEIGHT;
+            if top >= list_bottom {
+                break;
+            }
+            let row = RECT {
+                left: 6,
+                top,
+                right: client.right - 6,
+                bottom: (top + EXTENSION_ROW_HEIGHT).min(list_bottom),
+            };
+            let action_hover = ui.extension_hover == ExtensionHit::Action(index);
+            let pin_hover = ui.extension_hover == ExtensionHit::Pin(index);
+            if action_hover {
+                fill_round_rect(dc, &row, ui.palette.hover, 10, None);
+            }
+            let icon = RECT {
+                left: 12,
+                top: row.top,
+                right: 44,
+                bottom: row.bottom,
+            };
+            let icon_drawn = extension
+                .icon_path
+                .as_ref()
+                .is_some_and(|path| draw_image(dc, &icon, path, 20));
+            if !icon_drawn {
+                draw_icon(dc, &icon, Icon::Extensions, ui.palette.secondary);
+            }
+            let name = RECT {
+                left: 48,
+                top: row.top,
+                right: client.right - 122,
+                bottom: row.bottom,
+            };
+            draw_text(
+                dc,
+                &extension.name,
+                &name,
+                ui.title_font,
+                ui.palette.foreground,
+                DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            let pin_pill = RECT {
+                left: client.right - 114,
+                top: row.top + 8,
+                right: client.right - 10,
+                bottom: row.bottom - 8,
+            };
+            if pin_hover {
+                fill_round_rect(dc, &pin_pill, ui.palette.hover, 10, None);
+            }
+            let pin = RECT {
+                left: pin_pill.left + 8,
+                top: pin_pill.top,
+                right: pin_pill.right - 8,
+                bottom: pin_pill.bottom,
+            };
+            draw_text(
+                dc,
+                if extension.pinned {
+                    text("Открепить", "Unpin")
+                } else {
+                    text("Закрепить", "Pin")
+                },
+                &pin,
+                ui.small_font,
+                if extension.pinned {
+                    ui.palette.accent
+                } else {
+                    ui.palette.secondary
+                },
+                DT_CENTER | DT_END_ELLIPSIS,
+            );
+        }
+        let divider = RECT {
+            left: 14,
+            top: client.bottom - EXTENSION_MANAGE_HEIGHT - 1,
+            right: client.right - 14,
+            bottom: client.bottom - EXTENSION_MANAGE_HEIGHT,
+        };
+        let divider_brush = CreateSolidBrush(ui.palette.divider);
+        if !divider_brush.is_null() {
+            FillRect(dc, &divider, divider_brush);
+            DeleteObject(divider_brush as HGDIOBJ);
+        }
+        let manage = RECT {
+            left: 6,
+            top: client.bottom - EXTENSION_MANAGE_HEIGHT + 2,
+            right: client.right - 6,
+            bottom: client.bottom - 4,
+        };
+        FillRect(dc, &manage, ui.surface_brush);
+        if ui.extension_hover == ExtensionHit::Manage {
+            fill_round_rect(dc, &manage, ui.palette.hover, 10, None);
+        }
+        let manage_label = RECT {
+            left: 18,
+            top: manage.top,
+            right: manage.right - 12,
+            bottom: manage.bottom,
+        };
+        draw_text(
+            dc,
+            text("Управление расширениями", "Manage extensions"),
+            &manage_label,
+            ui.title_font,
+            ui.palette.foreground,
+            DT_LEFT | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+fn download_action_rect(width: i32, index: usize) -> RECT {
+    let top = 54 + index as i32 * 74;
+    RECT {
+        left: width - 126,
+        top: top + 18,
+        right: width - 62,
+        bottom: top + 52,
+    }
+}
+
+fn download_cancel_rect(width: i32, index: usize) -> RECT {
+    let top = 54 + index as i32 * 74;
+    RECT {
+        left: width - 56,
+        top: top + 18,
+        right: width - 14,
+        bottom: top + 52,
+    }
+}
+
+fn download_hit_at(ui: &NativeUi, x: i32, y: i32) -> DownloadHit {
+    let (width, _) = unsafe { client_size(ui.overlay_window) };
+    let close = RECT {
+        left: width - 46,
+        top: 8,
+        right: width - 10,
+        bottom: 44,
+    };
+    if point_in_rect(x, y, &close) {
+        return DownloadHit::Close;
+    }
+    for (index, download) in ui.downloads.iter().enumerate() {
+        let action = download_action_rect(width, index);
+        let cancel = download_cancel_rect(width, index);
+        match download.status {
+            DownloadStatus::Complete if point_in_rect(x, y, &action) => {
+                return DownloadHit::Action(index);
+            }
+            DownloadStatus::InProgress | DownloadStatus::Paused => {
+                if point_in_rect(x, y, &cancel) {
+                    return DownloadHit::Cancel(index);
+                }
+                if point_in_rect(x, y, &action) {
+                    return DownloadHit::Action(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    DownloadHit::None
+}
+
+fn download_hover_amount(ui: &NativeUi, hit: DownloadHit) -> f32 {
+    if ui.download_hover == hit
+        || (ui.download_hover == DownloadHit::None && ui.previous_download_hover == hit)
+    {
+        ui.download_hover_transition.value
+    } else {
+        0.0
+    }
+}
+
 unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
     unsafe {
         let mut client = RECT::default();
@@ -2861,6 +3639,8 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
             Some(ui.palette.divider),
         );
         SetBkMode(dc, TRANSPARENT as i32);
+        let english = ui.english;
+        let text = |russian, english_text| if english { english_text } else { russian };
         let title = RECT {
             left: 20,
             top: 8,
@@ -2869,7 +3649,7 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
         };
         draw_text(
             dc,
-            "Загрузки",
+            text("Загрузки", "Downloads"),
             &title,
             ui.font,
             ui.palette.foreground,
@@ -2881,6 +3661,16 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
             right: client.right - 10,
             bottom: 44,
         };
+        let close_hover = download_hover_amount(ui, DownloadHit::Close);
+        if close_hover > 0.0 {
+            fill_round_rect(
+                dc,
+                &close,
+                mix_color(ui.palette.surface, ui.palette.hover, close_hover),
+                12,
+                None,
+            );
+        }
         draw_icon(dc, &close, Icon::Close, ui.palette.secondary);
         if ui.downloads.is_empty() {
             let empty = RECT {
@@ -2891,7 +3681,7 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
             };
             draw_text(
                 dc,
-                "Загрузок пока нет",
+                text("Загрузок пока нет", "No downloads yet"),
                 &empty,
                 ui.title_font,
                 ui.palette.secondary,
@@ -2915,12 +3705,24 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
                 ui.palette.foreground,
                 DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
+            let is_crx = download
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("crx"));
             let status = match download.status {
                 DownloadStatus::InProgress => format!("{}%", download.percent.clamp(0, 100)),
-                DownloadStatus::Paused => "Пауза".to_owned(),
-                DownloadStatus::Complete => format_bytes(download.received.max(download.total)),
-                DownloadStatus::Canceled => "Отменено".to_owned(),
-                DownloadStatus::Interrupted => "Загрузка прервана".to_owned(),
+                DownloadStatus::Paused => text("Пауза", "Paused").to_owned(),
+                DownloadStatus::Complete if is_crx => {
+                    text("Готово к установке", "Ready to install").to_owned()
+                }
+                DownloadStatus::Complete => {
+                    format_bytes_localized(download.received.max(download.total), english)
+                }
+                DownloadStatus::Canceled => text("Отменено", "Canceled").to_owned(),
+                DownloadStatus::Interrupted => {
+                    text("Загрузка прервана", "Interrupted").to_owned()
+                }
             };
             let info = RECT {
                 left: 18,
@@ -2936,49 +3738,69 @@ unsafe fn draw_download_panel(ui: &NativeUi, dc: HDC) {
                 ui.palette.secondary,
                 DT_LEFT | DT_VCENTER,
             );
-            let action = RECT {
-                left: client.right - 126,
-                top: top + 17,
-                right: client.right - 62,
-                bottom: top + 52,
-            };
+            let action = download_action_rect(client.right, index);
+            let action_hover = download_hover_amount(ui, DownloadHit::Action(index));
             match download.status {
-                DownloadStatus::Complete => draw_text(
-                    dc,
-                    "Открыть",
-                    &action,
-                    ui.small_font,
-                    ui.palette.accent,
-                    DT_CENTER,
-                ),
-                DownloadStatus::InProgress | DownloadStatus::Paused => draw_icon(
-                    dc,
-                    &action,
-                    if download.status == DownloadStatus::Paused {
-                        Icon::Play
-                    } else {
-                        Icon::Pause
-                    },
-                    ui.palette.foreground,
-                ),
+                DownloadStatus::Complete => {
+                    fill_round_rect(
+                        dc,
+                        &action,
+                        mix_color(
+                            ui.palette.accent,
+                            ui.palette.foreground,
+                            action_hover * 0.18,
+                        ),
+                        17,
+                        None,
+                    );
+                    draw_text(
+                        dc,
+                        text("Открыть", "Open"),
+                        &action,
+                        ui.small_font,
+                        rgb(0xFF, 0xFF, 0xFF),
+                        DT_CENTER,
+                    );
+                }
+                DownloadStatus::InProgress | DownloadStatus::Paused => {
+                    if action_hover > 0.0 {
+                        fill_round_rect(
+                            dc,
+                            &action,
+                            mix_color(ui.palette.surface, ui.palette.hover, action_hover),
+                            12,
+                            None,
+                        );
+                    }
+                    draw_icon(
+                        dc,
+                        &action,
+                        if download.status == DownloadStatus::Paused {
+                            Icon::Play
+                        } else {
+                            Icon::Pause
+                        },
+                        ui.palette.foreground,
+                    );
+                }
                 _ => {}
             }
             if matches!(
                 download.status,
                 DownloadStatus::InProgress | DownloadStatus::Paused
             ) {
-                let cancel = RECT {
-                    left: client.right - 56,
-                    top: top + 17,
-                    right: client.right - 14,
-                    bottom: top + 52,
-                };
+                let cancel = download_cancel_rect(client.right, index);
+                let cancel_hover = download_hover_amount(ui, DownloadHit::Cancel(index));
+                if cancel_hover > 0.0 {
+                    fill_round_rect(
+                        dc,
+                        &cancel,
+                        mix_color(ui.palette.surface, ui.palette.hover, cancel_hover),
+                        12,
+                        None,
+                    );
+                }
                 draw_icon(dc, &cancel, Icon::Close, ui.palette.secondary);
-            }
-            if matches!(
-                download.status,
-                DownloadStatus::InProgress | DownloadStatus::Paused
-            ) {
                 let progress = RECT {
                     left: 18,
                     top: top + 62,
@@ -3042,13 +3864,21 @@ unsafe fn draw_text(dc: HDC, text: &str, rect: &RECT, font: HFONT, color: COLORR
     }
 }
 
-fn format_bytes(bytes: i64) -> String {
+fn format_bytes_localized(bytes: i64, english: bool) -> String {
     if bytes >= 1_048_576 {
-        format!("{:.1} МБ", bytes as f64 / 1_048_576.0)
+        format!(
+            "{:.1} {}",
+            bytes as f64 / 1_048_576.0,
+            if english { "MB" } else { "МБ" }
+        )
     } else if bytes >= 1024 {
-        format!("{:.0} КБ", bytes as f64 / 1024.0)
+        format!(
+            "{:.0} {}",
+            bytes as f64 / 1024.0,
+            if english { "KB" } else { "КБ" }
+        )
     } else {
-        format!("{bytes} Б")
+        format!("{bytes} {}", if english { "B" } else { "Б" })
     }
 }
 
@@ -3162,7 +3992,11 @@ fn main_menu_items(ui: &NativeUi) -> Vec<MainMenuItem> {
                     "",
                     false,
                 ),
-                MENU_UPDATE => (update_menu_label(&ui.update_status), "", false),
+                MENU_UPDATE => (
+                    update_menu_label_localized(&ui.update_status, use_english),
+                    "",
+                    false,
+                ),
                 _ => unreachable!(),
             };
             MainMenuItem {
@@ -3175,41 +4009,111 @@ fn main_menu_items(ui: &NativeUi) -> Vec<MainMenuItem> {
         .collect()
 }
 
-fn update_menu_label(status: &update::Status) -> String {
+fn update_menu_label_localized(status: &update::Status, english: bool) -> String {
     match status {
-        update::Status::Idle | update::Status::UpToDate => "Проверить обновления".to_owned(),
-        update::Status::Error(_) => "Повторить проверку обновлений".to_owned(),
-        update::Status::Checking => "Проверка обновлений…".to_owned(),
-        update::Status::Downloading { version, .. } => format!("Скачивание {version}"),
-        update::Status::Verifying { version } => format!("Проверка обновления {version}"),
-        update::Status::Installing { version } => format!("Установка {version}"),
+        update::Status::Idle | update::Status::UpToDate => if english {
+            "Check for updates"
+        } else {
+            "Проверить обновления"
+        }
+        .to_owned(),
+        update::Status::Error(_) => if english {
+            "Retry update check"
+        } else {
+            "Повторить проверку обновлений"
+        }
+        .to_owned(),
+        update::Status::Checking => if english {
+            "Checking for updates…"
+        } else {
+            "Проверка обновлений…"
+        }
+        .to_owned(),
+        update::Status::Downloading { version, .. } => {
+            if english {
+                format!("Downloading {version}")
+            } else {
+                format!("Скачивание {version}")
+            }
+        }
+        update::Status::Verifying { version } => {
+            if english {
+                format!("Verifying update {version}")
+            } else {
+                format!("Проверка обновления {version}")
+            }
+        }
+        update::Status::Installing { version } => {
+            if english {
+                format!("Installing {version}")
+            } else {
+                format!("Установка {version}")
+            }
+        }
     }
 }
 
+#[cfg(test)]
 fn update_menu_detail(status: &update::Status) -> String {
+    update_menu_detail_localized(status, false)
+}
+
+fn update_menu_detail_localized(status: &update::Status, english: bool) -> String {
     match status {
-        update::Status::Idle => format!("Текущая версия {}", crate::APP_VERSION),
-        update::Status::Checking => "Ищем новую версию на GitHub".to_owned(),
+        update::Status::Idle => {
+            if english {
+                format!("Current version {}", crate::APP_VERSION)
+            } else {
+                format!("Текущая версия {}", crate::APP_VERSION)
+            }
+        }
+        update::Status::Checking => if english {
+            "Checking GitHub for a new release"
+        } else {
+            "Ищем новую версию на GitHub"
+        }
+        .to_owned(),
         update::Status::Downloading {
             received,
             total: Some(total),
             ..
         } if *total > 0 => format!(
-            "{}% · {} из {}",
+            "{}% · {} {} {}",
             received.saturating_mul(100) / total,
-            format_bytes((*received).min(i64::MAX as u64) as i64),
-            format_bytes((*total).min(i64::MAX as u64) as i64)
+            format_bytes_localized((*received).min(i64::MAX as u64) as i64, english),
+            if english { "of" } else { "из" },
+            format_bytes_localized((*total).min(i64::MAX as u64) as i64, english)
         ),
         update::Status::Downloading { received, .. } => format!(
-            "Получено {}",
-            format_bytes((*received).min(i64::MAX as u64) as i64)
+            "{} {}",
+            if english { "Received" } else { "Получено" },
+            format_bytes_localized((*received).min(i64::MAX as u64) as i64, english)
         ),
-        update::Status::Verifying { .. } => "Проверяем SHA-256 установщика".to_owned(),
-        update::Status::Installing { .. } => {
-            "Установщик запущен, браузер перезапустится".to_owned()
+        update::Status::Verifying { .. } => if english {
+            "Verifying installer SHA-256"
+        } else {
+            "Проверяем SHA-256 установщика"
         }
-        update::Status::UpToDate => "Установлена последняя версия".to_owned(),
-        update::Status::Error(error) => format!("Ошибка: {error}"),
+        .to_owned(),
+        update::Status::Installing { .. } => if english {
+            "Installer started, browser will restart"
+        } else {
+            "Установщик запущен, браузер перезапустится"
+        }
+        .to_owned(),
+        update::Status::UpToDate => if english {
+            "Up to date"
+        } else {
+            "Установлена последняя версия"
+        }
+        .to_owned(),
+        update::Status::Error(error) => {
+            if english {
+                format!("Error: {error}")
+            } else {
+                format!("Ошибка: {error}")
+            }
+        }
     }
 }
 
@@ -3368,7 +4272,7 @@ unsafe fn draw_main_menu(ui: &NativeUi, dc: HDC) {
                 };
                 draw_text(
                     dc,
-                    &update_menu_detail(&ui.update_status),
+                    &update_menu_detail_localized(&ui.update_status, ui.english),
                     &detail,
                     ui.small_font,
                     if matches!(&ui.update_status, update::Status::Error(_)) {
@@ -3449,19 +4353,30 @@ unsafe fn show_tab_menu(window: HWND, id: u64) {
     unsafe {
         let Some(ui) = ui_mut(window) else { return };
         let controller = ui.controller.clone();
-        force_light_menus();
+        let english = ui.english;
+        apply_menu_theme(ui.dark_theme);
         let menu = CreatePopupMenu();
         AppendMenuW(
             menu,
             MF_STRING,
             MENU_PIN,
-            wide("Закрепить или открепить").as_ptr(),
+            wide(if english {
+                "Pin or unpin tab"
+            } else {
+                "Закрепить или открепить"
+            })
+            .as_ptr(),
         );
         AppendMenuW(
             menu,
             MF_STRING,
             MENU_CLOSE_TAB,
-            wide("Закрыть вкладку").as_ptr(),
+            wide(if english {
+                "Close tab"
+            } else {
+                "Закрыть вкладку"
+            })
+            .as_ptr(),
         );
         let point = cursor_position();
         let command = TrackPopupMenu(
@@ -3486,13 +4401,19 @@ unsafe fn show_bookmark_menu(window: HWND, index: usize) {
     unsafe {
         let Some(ui) = ui_mut(window) else { return };
         let controller = ui.controller.clone();
-        force_light_menus();
+        let english = ui.english;
+        apply_menu_theme(ui.dark_theme);
         let menu = CreatePopupMenu();
         AppendMenuW(
             menu,
             MF_STRING,
             MENU_REMOVE_BOOKMARK,
-            wide("Удалить закладку").as_ptr(),
+            wide(if english {
+                "Remove bookmark"
+            } else {
+                "Удалить закладку"
+            })
+            .as_ptr(),
         );
         let point = cursor_position();
         let command = TrackPopupMenu(
@@ -3652,7 +4573,42 @@ fn mix_color(from: COLORREF, to: COLORREF, amount: f32) -> COLORREF {
     channel(0) | (channel(8) << 8) | (channel(16) << 16)
 }
 
-unsafe fn force_light_menus() {
+unsafe fn adjust_for_autohide_taskbar(work: &mut RECT, monitor: &RECT) {
+    if work.left != monitor.left
+        || work.top != monitor.top
+        || work.right != monitor.right
+        || work.bottom != monitor.bottom
+    {
+        return;
+    }
+    unsafe {
+        let mut state_data = APPBARDATA {
+            cbSize: mem::size_of::<APPBARDATA>() as u32,
+            ..Default::default()
+        };
+        let state = SHAppBarMessage(ABM_GETSTATE, &mut state_data);
+        if (state as u32 & ABS_AUTOHIDE) == 0 {
+            return;
+        }
+        let mut pos_data = APPBARDATA {
+            cbSize: mem::size_of::<APPBARDATA>() as u32,
+            ..Default::default()
+        };
+        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut pos_data) != 0 {
+            match pos_data.uEdge {
+                ABE_TOP => work.top += 2,
+                ABE_BOTTOM => work.bottom -= 2,
+                ABE_LEFT => work.left += 2,
+                ABE_RIGHT => work.right -= 2,
+                _ => work.bottom -= 2,
+            }
+        } else {
+            work.bottom -= 2;
+        }
+    }
+}
+
+unsafe fn apply_menu_theme(dark: bool) {
     type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
     type FlushMenuThemes = unsafe extern "system" fn();
     unsafe {
@@ -3662,7 +4618,7 @@ unsafe fn force_light_menus() {
         }
         if let Some(function) = GetProcAddress(library, 135usize as *const u8) {
             let set_preferred: SetPreferredAppMode = mem::transmute(function);
-            set_preferred(1);
+            set_preferred(if dark { 2 } else { 3 });
         }
         if let Some(function) = GetProcAddress(library, 136usize as *const u8) {
             let flush: FlushMenuThemes = mem::transmute(function);
@@ -3797,5 +4753,11 @@ mod tests {
             }),
             Some(100)
         );
+        assert_eq!(
+            update_menu_label_localized(&update::Status::Idle, true),
+            "Check for updates"
+        );
+        assert!(update_menu_detail_localized(&downloading, true).contains("of"));
+        assert!(format_bytes_localized(2048, true).ends_with("KB"));
     }
 }

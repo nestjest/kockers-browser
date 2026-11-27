@@ -1,6 +1,5 @@
 /target/
 /dist/
 /.tmp/
+/.agents/
 *.log
-KIMI.md
-CONTEXT.md
